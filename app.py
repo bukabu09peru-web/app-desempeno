@@ -1,6 +1,8 @@
-"""Fotos de Drive y desempeño por colaborador desde PRODUCTIVIDAD."""
+"""Equipo por mesa y jefe, fotos de Drive y desempeño de PRODUCTIVIDAD."""
 import io
 import json
+import hashlib
+import re
 import unicodedata
 from pathlib import Path
 
@@ -13,6 +15,8 @@ from PIL import Image, ImageOps
 
 CARPETA_PREDETERMINADA = "1IZXOH9CeQk1XjNq3uvwWl2TkoKMNihcj"
 PRODUCTIVIDAD_PREDETERMINADA = "1G4lAKm4fxV6ZsPoKyN49Kt5-Ub__hCm6YTvR4GBgIGw"
+ESTRUCTURA_CARPETA_PREDETERMINADA = "1zQmGDrKYU4yl_Uyzy2bk9mOrnWbaAx80"
+ACCESOS_PREDETERMINADO = "1RHAWRHEIeRrhJFYzZTzGBGg8GUcR9wxGgwYPrbA7Xs4"
 SCOPE = ["https://www.googleapis.com/auth/drive.readonly",
          "https://www.googleapis.com/auth/spreadsheets.readonly"]
 FORMATOS = {"image/jpeg", "image/png", "image/webp", "image/gif"}
@@ -23,6 +27,214 @@ ORDEN_ORIGINAL = ["MESA", "ASESOR", "BOLSAS MEDIO DIA", "BOLSAS CIERRE",
                   "RECUPERACIÓN DE MORA (30%)", "RECUPERACION MORA AGOSTO", "MORA SEPTIEMBRE"]
 NOMBRES_ASESOR = {"asesor", "asesores", "colaborador", "colaboradores", "personal",
                   "nombre", "nombre completo"}
+SHEET_MIME = "application/vnd.google-apps.spreadsheet"
+XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def clave_mesa(mesa):
+    clave = re.sub(r"^mesa\s*", "", normalizar(mesa))
+    return str(int(float(clave))) if re.fullmatch(r"\d+(?:\.0+)?", clave) else clave
+
+
+def interpretar_estructura(filas):
+    """Soporta columnas de asesores/promotores y tablas con nombre/rol."""
+    alias = {
+        "mesa": {"mesa", "mesas"},
+        "jefe": {"jefe de credito", "jefe de creditos", "jefe credito", "jefe"},
+        "asesor": {"asesor", "asesores"},
+        "promotor": {"promotor", "promotores"},
+        "nombre": {"nombre", "nombre completo", "colaborador", "colaboradores", "personal", "asesor"},
+        "rol": {"rol", "cargo", "puesto"},
+    }
+    indices, inicio = {}, None
+    for i, fila in enumerate(filas[:10]):
+        titulos = [normalizar(v) for v in fila]
+        hallados = {k: next((j for j, titulo in enumerate(titulos) if titulo in nombres), None)
+                    for k, nombres in alias.items()}
+        largo = hallados["nombre"] is not None and hallados["rol"] is not None
+        ancho = hallados["asesor"] is not None or hallados["promotor"] is not None
+        if hallados["mesa"] is not None and hallados["jefe"] is not None and (largo or ancho):
+            indices, inicio = hallados, i
+            break
+    if inicio is None:
+        raise ValueError("ESTRUCTURA DE COLABORADORES necesita MESA/MESAS, JEFE DE CREDITO y ASESOR/ASESORES o PROMOTOR/PROMOTORES. También se admite NOMBRE y ROL.")
+    def valor(fila, campo):
+        j = indices.get(campo)
+        return str(fila[j]).strip() if j is not None and j < len(fila) and fila[j] is not None else ""
+    resultado, vistos, avisos = [], set(), []
+    mesa_actual = jefe_actual = ""
+    sin_mesa = sin_jefe = 0
+    def agregar(nombre, rol, mesa, jefe):
+        for persona in re.split(r"[\n;]+", nombre):
+            persona = " ".join(persona.split())
+            if not persona:
+                continue
+            clave = (normalizar(persona), clave_mesa(mesa), normalizar(jefe), rol)
+            if clave not in vistos:
+                vistos.add(clave)
+                resultado.append({"nombre": persona, "mesa": mesa, "jefe": jefe, "rol": rol})
+    for fila in filas[inicio+1:]:
+        if not any(v is not None and str(v).strip() for v in fila):
+            continue
+        mesa = valor(fila, "mesa")
+        jefe = valor(fila, "jefe")
+        if normalizar(mesa) in alias["mesa"] and normalizar(jefe) in alias["jefe"]:
+            continue  # encabezado repetido dentro de una tabla larga
+        if mesa:
+            if clave_mesa(mesa) != clave_mesa(mesa_actual):
+                jefe_actual = ""  # nunca heredar el jefe de otra mesa
+            mesa_actual = mesa
+        if jefe:
+            jefe_actual = jefe
+        mesa, jefe = mesa_actual, jefe_actual
+        if not mesa:
+            sin_mesa += 1
+            continue
+        if jefe:
+            agregar(jefe, "JEFE DE CRÉDITO", mesa, jefe)
+        if indices["rol"] is not None and indices["nombre"] is not None:
+            rol = valor(fila, "rol")
+            nr = normalizar(rol)
+            rol = ("ASESOR" if "asesor" in nr else "PROMOTOR" if "promotor" in nr
+                   else "JEFE DE CRÉDITO" if "jefe" in nr else rol.upper() or "SIN ROL")
+            agregar(valor(fila, "nombre"), rol, mesa, jefe)
+        else:
+            agregar(valor(fila, "asesor"), "ASESOR", mesa, jefe)
+            agregar(valor(fila, "promotor"), "PROMOTOR", mesa, jefe)
+        if not jefe:
+            sin_jefe += 1
+    if sin_mesa:
+        avisos.append(f"Se omitieron {sin_mesa} filas sin mesa identificable.")
+    if sin_jefe:
+        avisos.append(f"Hay {sin_jefe} filas de estructura sin jefe asignado; revisa ESTRUCTURA DE COLABORADORES.")
+    return resultado, avisos
+
+
+def escoger_hoja(titulos, preferida):
+    exactas = [t for t in titulos if normalizar(t) == normalizar(preferida)]
+    if len(exactas) == 1:
+        return exactas[0]
+    alternativas = [t for t in titulos if normalizar(t) in {"colaboradores", "estructura de colaboradores"}]
+    if len(alternativas) == 1:
+        return alternativas[0]
+    raise ValueError("ACCESOS debe contener la pestaña ESTRUCTURA DE COLABORADORES. Si tiene otro nombre, configúralo como hoja_colaboradores en [app] de Secrets.")
+
+
+def descargar_excel(drive, archivo):
+    limite = 20 * 1024 * 1024
+    if int(archivo.get("size", 0)) > limite:
+        raise ValueError("ACCESOS supera 20 MB. Usa una copia de menor tamaño o una hoja de Google.")
+    buffer = io.BytesIO()
+    peticion = drive.files().get_media(fileId=archivo["id"], supportsAllDrives=True)
+    lector = MediaIoBaseDownload(buffer, peticion, chunksize=1024 * 1024)
+    completo = False
+    while not completo:
+        _, completo = lector.next_chunk(num_retries=2)
+        if buffer.tell() > limite:
+            raise ValueError("ACCESOS supera 20 MB.")
+    return buffer.getvalue()
+
+
+def filas_excel(contenido, hoja):
+    from openpyxl import load_workbook
+    libro = load_workbook(io.BytesIO(contenido), read_only=True, data_only=True, keep_links=False)
+    try:
+        titulo = escoger_hoja(libro.sheetnames, hoja)
+        filas = [["" if v is None else v for v in fila] for fila in libro[titulo].iter_rows(values_only=True)]
+        return filas
+    finally:
+        libro.close()
+
+
+def localizar_accesos(drive, carpeta_id, archivo_id=""):
+    if archivo_id:
+        return drive.files().get(fileId=archivo_id, fields="id,name,mimeType,size",
+                                 supportsAllDrives=True).execute(num_retries=2)
+    carpeta_segura = carpeta_id.replace("\\", "\\\\").replace("'", "\\'")
+    candidatos, token = [], None
+    while True:
+        respuesta = drive.files().list(
+            q=f"'{carpeta_segura}' in parents and trashed = false",
+            fields="nextPageToken,files(id,name,mimeType,size)", pageSize=1000,
+            pageToken=token, spaces="drive", supportsAllDrives=True, includeItemsFromAllDrives=True,
+        ).execute(num_retries=2)
+        for f in respuesta.get("files", []):
+            nombre = Path(f["name"]).stem if f["name"].lower().endswith((".xlsx", ".xls")) else f["name"]
+            if normalizar(nombre) == "accesos" and (f["mimeType"] in {SHEET_MIME, XLSX_MIME}
+                    or f["name"].lower().endswith((".xlsx", ".xls"))):
+                candidatos.append(f)
+        token = respuesta.get("nextPageToken")
+        if not token:
+            break
+    if not candidatos:
+        raise ValueError("No se encontró ACCESOS dentro de ESTRUCTURA Y ACCESOS. Comparte la carpeta como Lector con lector-colaboradores y comprueba el nombre del archivo.")
+    if len(candidatos) > 1:
+        raise ValueError("Hay varios archivos llamados ACCESOS. Configura accesos_id en [app] de Secrets con el ID del archivo que debe usarse.")
+    return candidatos[0]
+
+
+@st.cache_data(ttl=60, max_entries=8, show_spinner=False)
+def leer_estructura(carpeta_id, archivo_id, hoja, credenciales_json):
+    drive = servicio(credenciales_json)
+    archivo = localizar_accesos(drive, carpeta_id, archivo_id)
+    if archivo["mimeType"] == SHEET_MIME:
+        sheets = servicio(credenciales_json, "sheets", "v4")
+        metadata = sheets.spreadsheets().get(spreadsheetId=archivo["id"],
+                    fields="sheets(properties(title))").execute(num_retries=2)
+        titulo = escoger_hoja([s["properties"]["title"] for s in metadata.get("sheets", [])], hoja)
+        filas = sheets.spreadsheets().values().get(spreadsheetId=archivo["id"],
+            range="'"+titulo.replace("'", "''")+"'", valueRenderOption="FORMATTED_VALUE"
+        ).execute(num_retries=2).get("values", [])
+    elif archivo["mimeType"] == XLSX_MIME or archivo["name"].lower().endswith(".xlsx"):
+        filas = filas_excel(descargar_excel(drive, archivo), hoja)
+    else:
+        raise ValueError("Guarda ACCESOS como .xlsx o conviértelo a una hoja de Google. El formato .xls no está admitido.")
+    equipo, avisos = interpretar_estructura(filas)
+    return equipo, avisos
+
+
+def error_estructura(error):
+    if isinstance(error, HttpError) and error.resp.status in (401, 403, 404):
+        return "Comparte ESTRUCTURA Y ACCESOS y su archivo ACCESOS como Lector con la cuenta lector-colaboradores. Comprueba también Google Drive API y Google Sheets API."
+    if isinstance(error, ValueError):
+        return str(error)
+    return "No se pudo leer ESTRUCTURA DE COLABORADORES. Revisa el archivo, su formato y los permisos de lectura."
+
+
+def construir_equipo(fotos, estructura):
+    """Conserva personas sin foto y fotos nuevas aún no asignadas a una mesa."""
+    equipo, usadas = [], set()
+    nombres_estructura = {normalizar(c["nombre"]) for c in estructura}
+    for colaborador in estructura:
+        nombre = normalizar(colaborador["nombre"])
+        candidatas = [f for f in fotos if normalizar(f["colaborador"]) == nombre]
+        if not candidatas:
+            aproximadas = [f for f in fotos if coincide_abreviado(nombre, normalizar(f["colaborador"]))]
+            if len(aproximadas) == 1:
+                foto_nombre = normalizar(aproximadas[0]["colaborador"])
+                if len({n for n in nombres_estructura if coincide_abreviado(n, foto_nombre)}) == 1:
+                    candidatas = aproximadas
+        foto = candidatas[0] if len(candidatas) == 1 else None
+        if foto:
+            usadas.add(foto["id"])
+        c = dict(colaborador, foto=foto)
+        clave = [normalizar(c["nombre"]), clave_mesa(c["mesa"]), normalizar(c["jefe"]), c["rol"]]
+        c["id"] = "equipo_"+hashlib.sha256(json.dumps(clave).encode()).hexdigest()[:20]
+        equipo.append(c)
+    for foto in fotos:
+        if foto["id"] not in usadas:
+            equipo.append({"nombre": foto["colaborador"], "mesa": "", "jefe": "", "rol": "SIN ESTRUCTURA",
+                           "foto": foto, "id": "foto_"+foto["id"]})
+    return sorted(equipo, key=lambda c: (normalizar(c["mesa"]), normalizar(c["jefe"]), normalizar(c["nombre"]), c["rol"]))
+
+
+def filtrar_equipo(equipo, mesa="Todas", jefe="Todos", rol="Todos", busqueda=""):
+    return [c for c in equipo if (mesa == "Todas" or (mesa == "Sin mesa" and not c["mesa"])
+                    or clave_mesa(c["mesa"]) == clave_mesa(mesa))
+            and (jefe == "Todos" or (jefe == "Sin jefe asignado" and not c["jefe"])
+                 or normalizar(c["jefe"]) == normalizar(jefe))
+            and (rol == "Todos" or c["rol"] == rol)
+            and normalizar(busqueda) in normalizar(c["nombre"])]
 
 
 def nombre_colaborador(archivo):
@@ -87,7 +299,12 @@ def coincide_abreviado(a, b):
     return a == b or a.startswith(b + " ") or b.startswith(a + " ")
 
 
-def buscar_desempeno(nombre, registros, nombres_fotos):
+def buscar_desempeno(nombre, registros, nombres_fotos, mesa=""):
+    # La misma persona puede aparecer en varias mesas. Nunca tomar el desempeño
+    # de otra mesa; si la hoja no trae mesa, se permite la coincidencia por nombre.
+    if mesa:
+        misma_mesa = [r for r in registros if clave_mesa(r["mesa"]) == clave_mesa(mesa)]
+        registros = misma_mesa + [r for r in registros if not r["mesa"]]
     buscado = normalizar(nombre)
     exactos = [r for r in registros if normalizar(r["nombre"]) == buscado]
     if exactos:
@@ -138,7 +355,7 @@ def error_productividad(error):
 def mostrar_indicadores(registros, tipo, archivo_id):
     if not registros:
         st.caption("Nombre ambiguo: haz coincidir el nombre completo de la foto y el de la hoja." if tipo == "ambigua"
-                   else "Sin desempeño asociado. Revisa que el nombre coincida con la hoja.")
+                   else "Sin desempeño asociado a esta persona y mesa. Revisa el nombre en la hoja.")
         return
     if len(registros) > 1:
         st.caption("Hay varios registros para este nombre; selecciona cuál consultar.")
@@ -242,7 +459,10 @@ def configuracion():
             valores.get("gcp_service_account"),
             bool(opciones.get("demo_mode", False)),
             str(opciones.get("productividad_id", PRODUCTIVIDAD_PREDETERMINADA)),
-            str(opciones.get("hoja_desempeno", "DESEMPEÑO")))
+            str(opciones.get("hoja_desempeno", "DESEMPEÑO")),
+            str(opciones.get("estructura_carpeta_id", ESTRUCTURA_CARPETA_PREDETERMINADA)),
+            str(opciones.get("accesos_id", ACCESOS_PREDETERMINADO)),
+            str(opciones.get("hoja_colaboradores", "ESTRUCTURA DE COLABORADORES")))
 
 
 def foto_demo(indice):
@@ -258,12 +478,29 @@ def foto_demo(indice):
     return buffer.getvalue()
 
 
+def opciones_unicas(valores, clave=normalizar):
+    opciones = {}
+    for valor in valores:
+        if valor:
+            opciones.setdefault(clave(valor), valor)
+    return sorted(opciones.values(), key=normalizar)
+
+
+def filtro(etiqueta, opciones, key):
+    # Si el usuario cambia de mesa o se actualiza Drive, la selección anterior
+    # puede dejar de existir entre las opciones dependientes.
+    if st.session_state.get(key) not in opciones:
+        st.session_state[key] = opciones[0]
+    return st.selectbox(etiqueta, opciones, key=key)
+
+
 def main():
     st.set_page_config(page_title="Desempeño · Colaboradores", page_icon="👥", layout="wide")
     st.title("👥 Desempeño del equipo")
-    st.caption("Fotos de colaboradores y datos de PRODUCTIVIDAD")
+    st.caption("Organización por mesa y jefe de crédito · Fotos y desempeño del equipo")
     try:
-        carpeta_id, credenciales, demo, productividad_id, hoja_desempeno = configuracion()
+        (carpeta_id, credenciales, demo, productividad_id, hoja_desempeno,
+         estructura_carpeta_id, accesos_id, hoja_colaboradores) = configuracion()
     except Exception:
         st.error("La configuración no es válida. Revisa Settings → Secrets.")
         return
@@ -281,9 +518,10 @@ def main():
         if st.button("Actualizar ahora"):
             listar_fotos.clear()
             leer_desempeno.clear()
+            leer_estructura.clear()
         automatico = st.checkbox("Actualizar cada minuto", value=True)
         st.caption("La actualización automática funciona mientras esta página está abierta y activa.")
-        st.caption("Nombre mostrado: nombre de la foto, sin la extensión.")
+        st.caption("La estructura se toma de ACCESOS. Las fotos se relacionan por nombre.")
     @st.fragment(run_every=60 if automatico else None)
     def galeria():
         if demo:
@@ -293,53 +531,103 @@ def main():
             omitidas = 0
             registros, avisos = interpretar_desempeno([
                 ORDEN_ORIGINAL,
-                ["MESA DEMO", "Ana Ejemplo", "5", "12", "3", "4", "1", "3", "S/ 1,000.00", "S/ 700.00", "30%", "S/ 100.00", "S/ 200.00"],
-                ["MESA DEMO", "Carlos Ejemplo", "6", "15", "4", "2", "0", "2", "S/ 1,500.00", "S/ 900.00", "25%", "S/ 150.00", "S/ 250.00"],
-                ["MESA DEMO", "María Ejemplo", "7", "18", "5", "3", "0", "3", "S/ 2,000.00", "S/ 800.00", "40%", "S/ 120.00", "S/ 300.00"],
+                ["MESA 1", "Ana Ejemplo", "5", "12", "3", "4", "1", "3", "S/ 1,000.00", "S/ 700.00", "30%", "S/ 100.00", "S/ 200.00"],
+                ["MESA 1", "Carlos Ejemplo", "6", "15", "4", "2", "0", "2", "S/ 1,500.00", "S/ 900.00", "25%", "S/ 150.00", "S/ 250.00"],
+                ["MESA 2", "María Ejemplo", "7", "18", "5", "3", "0", "3", "S/ 2,000.00", "S/ 800.00", "40%", "S/ 120.00", "S/ 300.00"],
+            ])
+            estructura, avisos_estructura = interpretar_estructura([
+                ["MESAS", "JEFE DE CREDITO", "ASESORES", "PROMOTORES"],
+                ["MESA 1", "Lucía Ejemplo", "Ana Ejemplo", "Luis Ejemplo"],
+                ["", "", "Carlos Ejemplo", ""],
+                ["MESA 2", "Pedro Ejemplo", "María Ejemplo", ""],
             ])
             fallo_desempeno = False
         else:
             try:
                 fotos, omitidas = listar_fotos(carpeta_id, cred_json)
             except Exception as error:
-                st.error(error_amigable(error))
-                return
+                fotos, omitidas = [], 0
+                st.warning("No se pudieron consultar las fotos. " + error_amigable(error))
             try:
                 registros, avisos = leer_desempeno(productividad_id, hoja_desempeno, cred_json)
                 fallo_desempeno = False
             except Exception as error:
                 registros, avisos = [], []
                 fallo_desempeno = True
-                st.warning("Las fotos están disponibles, pero falta el desempeño. " + error_productividad(error))
-        for aviso in avisos:
+                st.warning("Desempeño no disponible. " + error_productividad(error))
+            try:
+                estructura, avisos_estructura = leer_estructura(
+                    estructura_carpeta_id, accesos_id, hoja_colaboradores, cred_json)
+            except Exception as error:
+                estructura, avisos_estructura = [], []
+                st.warning("Estructura no disponible. " + error_estructura(error))
+        for aviso in avisos + avisos_estructura:
             st.info(aviso)
-        st.metric("Fotos de colaboradores", len(fotos))
         if omitidas:
             st.warning(f"Hay {omitidas} imágenes con formato no compatible. Usa JPG, PNG, WEBP o GIF.")
-        if not fotos:
-            st.info("Todavía no hay fotos compatibles en esta carpeta. Coloca cada foto directamente dentro de ella, por ejemplo: Ana López.jpg.")
+        equipo = construir_equipo(fotos, estructura)
+        if not equipo:
+            st.info("Todavía no hay colaboradores para mostrar. Revisa los avisos, añade personas a ESTRUCTURA DE COLABORADORES o coloca fotos con sus nombres en la carpeta de fotos.")
             return
         nombres = [normalizar(f["colaborador"]) for f in fotos]
         if len(nombres) != len(set(nombres)):
-            st.warning("Hay fotos con el mismo nombre. Cada archivo se muestra como una tarjeta; revisa si hay duplicados.")
-        if not fallo_desempeno:
-            vinculados = sum(bool(buscar_desempeno(f["colaborador"], registros, [p["colaborador"] for p in fotos])[0]) for f in fotos)
-            st.caption(f"{vinculados} de {len(fotos)} fotos tienen coincidencia con {hoja_desempeno}.")
+            st.warning("Hay fotos con el mismo nombre. No se asignan a la estructura hasta resolver el duplicado.")
+        sin_estructura = sum(c["rol"] == "SIN ESTRUCTURA" for c in equipo)
+        if sin_estructura:
+            st.caption(f"{sin_estructura} fotos aparecen como SIN ESTRUCTURA. Añade sus nombres a ESTRUCTURA DE COLABORADORES para asignarles mesa, jefe y rol.")
+        st.subheader("Filtrar el equipo")
+        columnas_filtros = st.columns(3)
+        mesas = ["Todas"] + opciones_unicas((c["mesa"] for c in equipo), clave=clave_mesa)
+        if any(not c["mesa"] for c in equipo):
+            mesas.append("Sin mesa")
+        with columnas_filtros[0]:
+            mesa = filtro("Mesa", mesas, "filtro_mesa")
+        por_mesa = filtrar_equipo(equipo, mesa=mesa)
+        jefes = ["Todos"] + opciones_unicas(c["jefe"] for c in por_mesa)
+        if any(not c["jefe"] for c in por_mesa):
+            jefes.append("Sin jefe asignado")
+        with columnas_filtros[1]:
+            jefe = filtro("Jefe de crédito", jefes, "filtro_jefe")
+        por_jefe = filtrar_equipo(por_mesa, jefe=jefe)
+        roles = ["Todos"] + opciones_unicas(c["rol"] for c in por_jefe)
+        with columnas_filtros[2]:
+            rol = filtro("Rol", roles, "filtro_rol")
         texto = st.text_input("Buscar por nombre", placeholder="Escribe el nombre de un colaborador")
-        visibles = [f for f in fotos if normalizar(texto) in normalizar(f["colaborador"])]
+        visibles = filtrar_equipo(equipo, mesa, jefe, rol, texto)
+        resumen = st.columns(4)
+        for columna, etiqueta, valor in [
+            (resumen[0], "Personas", len({normalizar(c["nombre"]) for c in visibles})),
+            (resumen[1], "Mesas", len({clave_mesa(c["mesa"]) for c in visibles if c["mesa"]})),
+            (resumen[2], "Asesores", len({normalizar(c["nombre"]) for c in visibles if c["rol"] == "ASESOR"})),
+            (resumen[3], "Promotores", len({normalizar(c["nombre"]) for c in visibles if c["rol"] == "PROMOTOR"})),
+        ]:
+            columna.metric(etiqueta, valor)
         if not visibles:
-            st.info("No hay coincidencias con ese nombre.")
+            st.info("No hay colaboradores con estos filtros.")
             return
+        with st.expander("Ver estructura del equipo"):
+            st.dataframe([{"Mesa": c["mesa"] or "Sin mesa", "Jefe de crédito": c["jefe"] or "Sin jefe asignado",
+                           "Colaborador": c["nombre"], "Rol": c["rol"],
+                           "Foto": "Disponible" if c["foto"] else "Pendiente"} for c in visibles],
+                         hide_index=True, width="stretch")
+        nombres_equipo = [c["nombre"] for c in equipo]
+        if not fallo_desempeno:
+            vinculados = sum(bool(buscar_desempeno(c["nombre"], registros, nombres_equipo, c["mesa"])[0]) for c in visibles)
+            st.caption(f"{vinculados} de {len(visibles)} asignaciones visibles tienen desempeño asociado.")
         # Paginación: evita descargar todas las fotos de una carpeta grande.
         paginas = max(1, (len(visibles)+11)//12)
-        pagina = st.selectbox("Página", list(range(1, paginas+1)))
+        pagina = filtro("Página", list(range(1, paginas+1)), "pagina")
+        st.caption(f"{len(visibles)} asignaciones · Página {pagina} de {paginas}")
         visibles = visibles[(pagina-1)*12:pagina*12]
         columnas = st.columns(3)
-        for i, archivo in enumerate(visibles):
+        for i, colaborador in enumerate(visibles):
             with columnas[i % 3]:
                 with st.container(border=True):
+                    archivo = colaborador["foto"]
                     try:
-                        if demo:
+                        if not archivo:
+                            contenido = foto_demo(1)
+                        elif demo:
                             contenido = foto_demo(int(archivo["id"]))
                         else:
                             if int(archivo.get("size", 0)) > MAX_BYTES:
@@ -348,13 +636,18 @@ def main():
                         st.image(contenido, width="stretch")
                     except Exception:
                         st.warning("No se pudo cargar esta foto. Comprueba el formato, tamaño y permisos.")
-                    st.text(archivo["colaborador"])
+                    if not archivo:
+                        st.caption("Foto pendiente")
+                    st.text(colaborador["nombre"])
+                    st.caption(colaborador["rol"])
+                    st.text("Mesa: " + (colaborador["mesa"] or "Sin mesa"))
+                    st.text("Jefe: " + (colaborador["jefe"] or "Sin jefe asignado"))
                     if fallo_desempeno:
                         st.caption("Desempeño no disponible: revisa el aviso de conexión.")
                     else:
-                        registros_persona, tipo = buscar_desempeno(archivo["colaborador"], registros, [p["colaborador"] for p in fotos])
-                        mostrar_indicadores(registros_persona, tipo, archivo["id"])
-        st.caption("Una foto por colaborador. La galería consulta los archivos ubicados directamente en la carpeta; no recorre subcarpetas ni accesos directos.")
+                        registros_persona, tipo = buscar_desempeno(colaborador["nombre"], registros, nombres_equipo, colaborador["mesa"])
+                        mostrar_indicadores(registros_persona, tipo, colaborador["id"])
+        st.caption("ESTRUCTURA DE COLABORADORES define mesa, jefe y rol. Una persona con varias asignaciones aparece en cada una. Las fotos se buscan directamente en la carpeta, sin recorrer subcarpetas.")
     galeria()
 
 
