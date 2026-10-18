@@ -8,7 +8,6 @@ import hmac
 import re
 import unicodedata
 from pathlib import Path
-from urllib.parse import quote
 
 import streamlit as st
 from google.oauth2.service_account import Credentials
@@ -333,7 +332,15 @@ def interpretar_login(filas):
         j = indices.get(campo)
         if j is None or j >= len(fila) or fila[j] is None:
             return ""
-        resultado = str(fila[j])
+        dato = fila[j]
+        # Excel puede entregar usuarios o contraseñas numéricos como 131213.0;
+        # Sheets los entrega normalmente como 131213. Normalizamos ambos igual.
+        if isinstance(dato, bool):
+            resultado = "TRUE" if dato else "FALSE"
+        elif isinstance(dato, float) and dato.is_integer():
+            resultado = str(int(dato))
+        else:
+            resultado = str(dato)
         return resultado if conservar_espacios else resultado.strip()
 
     cuentas = []
@@ -413,7 +420,10 @@ def cuentas_demo():
 
 
 def limpiar_filtros_sesion():
-    for clave in ("filtro_mesa", "filtro_jefe", "filtro_rol", "pagina"):
+    for clave in (
+        "filtro_mesa", "filtro_jefe", "filtro_rol", "pagina", "pagina_dashboard",
+        "colaborador_seleccionado",
+    ):
         st.session_state.pop(clave, None)
 
 
@@ -906,26 +916,31 @@ def mostrar_foto(persona, demo, credenciales_json, ancho="stretch"):
 
 
 def mostrar_tarjeta_colaborador(persona, demo, credenciales_json):
-    """La foto es el enlace que abre la ficha individual; la tarjeta no revela KPI."""
+    """Tarjeta con navegación interna; no cambia la URL ni reinicia la sesión."""
     try:
         contenido, mime, pendiente = obtener_foto_bytes(persona, demo, credenciales_json)
     except Exception:
         contenido, mime, pendiente = foto_demo(1), "image/png", False
-    imagen = base64.b64encode(contenido).decode("ascii")
-    url = "?colaborador=" + quote(str(persona["id"]))
+
     nombre = html.escape(str(persona.get("nombre", "Sin nombre")))
-    rol = html.escape(str(persona.get("rol", "" )).title())
+    rol = html.escape(str(persona.get("rol", "")).title())
     mesa = html.escape(str(persona.get("mesa", "Sin mesa") or "Sin mesa"))
-    nota = '<div class="person-meta">Foto pendiente</div>' if pendiente else ""
-    st.markdown(
-        '<div class="person-card">'
-        '<a class="person-photo-link" href="' + url + '" target="_self" title="Abrir desempeño de ' + nombre + '">'
-        '<img src="data:' + mime + ';base64,' + imagen + '" alt="Foto de ' + nombre + '"></a>'
-        '<div class="person-name">' + nombre + '</div>'
-        '<div class="person-meta">' + rol + ' · ' + mesa + '</div>' + nota +
-        '<a class="person-open" href="' + url + '" target="_self">Ver desempeño →</a>'
-        '</div>', unsafe_allow_html=True
-    )
+    clave_boton = "abrir_ficha_" + str(persona["id"])
+
+    with st.container(border=True):
+        st.image(contenido, width="stretch")
+        st.markdown(
+            '<div class="person-name">' + nombre + '</div>'
+            '<div class="person-meta">' + rol + ' · ' + mesa + '</div>',
+            unsafe_allow_html=True,
+        )
+        if pendiente:
+            st.caption("Foto pendiente")
+        if st.button("Ver desempeño →", key=clave_boton, use_container_width=True):
+            # Mantiene login_usuario en la misma sesión de Streamlit.
+            # Nunca se navega a una URL nueva para abrir la ficha.
+            st.session_state["colaborador_seleccionado"] = str(persona["id"])
+            st.rerun()
 
 
 def mostrar_perfil_dashboard(persona, demo, credenciales_json):
@@ -1094,13 +1109,13 @@ def main():
             return
 
         # La selección se acepta únicamente si el colaborador pertenece al alcance ya autorizado.
-        seleccionado_id = str(st.query_params.get("colaborador", "") or "")
+        seleccionado_id = str(st.session_state.get("colaborador_seleccionado", "") or "")
         if seleccionado_id:
             persona_seleccionada = next((c for c in equipo
                 if c.get("id") == seleccionado_id and c.get("rol") != "JEFE DE CRÉDITO"), None)
             if persona_seleccionada:
                 if st.button("← Volver al equipo", type="secondary"):
-                    st.query_params.pop("colaborador", None)
+                    st.session_state.pop("colaborador_seleccionado", None)
                     st.rerun()
                 st.subheader("Ficha individual de desempeño")
                 mostrar_perfil_dashboard(persona_seleccionada, demo, cred_json)
@@ -1112,13 +1127,13 @@ def main():
                         persona_seleccionada["mesa"])
                     mostrar_indicadores(registros_persona, tipo_nombre, persona_seleccionada["id"])
                 return
-            # Evita mantener en la URL una ficha fuera del alcance del usuario.
-            st.query_params.pop("colaborador", None)
+            # Evita mantener una ficha que ya no pertenece al alcance autorizado.
+            st.session_state.pop("colaborador_seleccionado", None)
             st.rerun()
             return
 
         st.subheader("Dashboard del equipo")
-        st.caption("Selecciona una foto para abrir la ficha del colaborador y ver sus indicadores. No se muestran datos individuales hasta entrar en la ficha.")
+        st.caption("Pulsa «Ver desempeño» en la tarjeta de un colaborador para abrir su ficha sin volver a iniciar sesión.")
         if tipo_acceso == "total":
             st.caption("Vista de acceso total autorizada por LOGIN.")
         nombres_fotos = [normalizar(f["colaborador"]) for f in fotos]
