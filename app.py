@@ -2,6 +2,7 @@
 import io
 import json
 import hashlib
+import hmac
 import re
 import unicodedata
 from pathlib import Path
@@ -17,6 +18,7 @@ CARPETA_PREDETERMINADA = "1IZXOH9CeQk1XjNq3uvwWl2TkoKMNihcj"
 PRODUCTIVIDAD_PREDETERMINADA = "1G4lAKm4fxV6ZsPoKyN49Kt5-Ub__hCm6YTvR4GBgIGw"
 ESTRUCTURA_CARPETA_PREDETERMINADA = "1zQmGDrKYU4yl_Uyzy2bk9mOrnWbaAx80"
 ACCESOS_PREDETERMINADO = "1RHAWRHEIeRrhJFYzZTzGBGg8GUcR9wxGgwYPrbA7Xs4"
+LOGIN_HOJA_PREDETERMINADA = "LOGIN"
 SCOPE = ["https://www.googleapis.com/auth/drive.readonly",
          "https://www.googleapis.com/auth/spreadsheets.readonly"]
 FORMATOS = {"image/jpeg", "image/png", "image/webp", "image/gif"}
@@ -285,6 +287,245 @@ def normalizar(texto):
                             if unicodedata.category(c) != "Mn").split())
 
 
+LOGIN_ALIAS = {
+    "usuario": {"usuario", "user", "username", "nombre de usuario", "login", "usuario de acceso", "correo", "email", "e mail"},
+    "password": {"password", "contrasena", "clave", "pass", "contrasena de acceso", "password de acceso"},
+    "activo": {"activo", "activa", "estado", "estatus", "status", "active", "habilitado", "habilitada", "estado de usuario", "acceso activo"},
+    "nombre": {"personal", "nombre", "nombre completo", "nombre del usuario", "nombre y apellido", "colaborador", "persona"},
+    "info_equipo": {"informacion del equipo", "informacion equipo", "info del equipo", "informacion de equipo", "acceso a informacion del equipo", "ver informacion del equipo"},
+    "editar": {"editar", "permiso editar", "puede editar", "edicion"},
+    "bonificacion": {"bonificacion", "bonificaciones", "permiso bonificacion", "ver bonificacion", "ver bonificaciones"},
+    "rol": {"rol", "perfil", "tipo de usuario", "tipo usuario", "cargo", "nivel de acceso", "tipo de acceso", "rol de usuario"},
+    "jefe": {"jefe de credito", "jefe de creditos", "jefe credito", "jefe", "nombre del jefe", "nombre jefe de credito", "jefe asignado"},
+    "mesa": {"mesa", "mesas", "mesa asignada", "equipo", "equipo asignado"},
+}
+
+ESTADOS_ACTIVOS = {"activo", "activa", "si", "s", "1", "true", "yes", "habilitado", "habilitada", "vigente", "enabled"}
+ROLES_ADMIN = {"admin", "administrador", "administradora", "superadmin", "administrador del sistema", "administradora del sistema"}
+ROLES_JEFE = {"jefe", "jefe de credito", "jefe de creditos", "jefatura", "supervisor", "supervisora", "coordinador", "coordinadora", "manager", "gerente"}
+ROLES_INDIVIDUALES = {"asesor", "asesora", "promotor", "promotora", "colaborador", "colaboradora", "personal"}
+
+
+def estado_activo(valor):
+    """Solo concede acceso cuando la celda contiene un estado afirmativo conocido."""
+    if isinstance(valor, bool):
+        return valor
+    return normalizar(valor) in ESTADOS_ACTIVOS
+
+
+def interpretar_login(filas):
+    """Lee LOGIN sin depender del orden de columnas; por seguridad exige usuario, clave y estado."""
+    indices, inicio = {}, None
+    for i, fila in enumerate(filas[:10]):
+        titulos = [normalizar(v) for v in fila]
+        hallados = {campo: next((j for j, titulo in enumerate(titulos) if titulo in alias), None)
+                    for campo, alias in LOGIN_ALIAS.items()}
+        if all(hallados[campo] is not None for campo in ("usuario", "password", "activo")):
+            indices, inicio = hallados, i
+            break
+    if inicio is None:
+        raise ValueError("La pestaña LOGIN debe tener encabezados para USUARIO, PASSWORD/CONTRASEÑA y ACTIVO/ESTADO en las primeras 10 filas.")
+
+    def valor(fila, campo, conservar_espacios=False):
+        j = indices.get(campo)
+        if j is None or j >= len(fila) or fila[j] is None:
+            return ""
+        resultado = str(fila[j])
+        return resultado if conservar_espacios else resultado.strip()
+
+    cuentas = []
+    for fila in filas[inicio + 1:]:
+        usuario = valor(fila, "usuario")
+        if not usuario:
+            continue
+        cuentas.append({
+            "usuario": usuario,
+            "password": valor(fila, "password", conservar_espacios=True),
+            "activo": estado_activo(valor(fila, "activo")),
+            "nombre": valor(fila, "nombre"),
+            "informacion_equipo": valor(fila, "info_equipo").strip().upper(),
+            "editar": valor(fila, "editar").strip().upper(),
+            "bonificacion": valor(fila, "bonificacion").strip().upper(),
+            "rol": valor(fila, "rol"),
+            "jefe": valor(fila, "jefe"),
+            "mesa": valor(fila, "mesa"),
+        })
+    if not cuentas:
+        raise ValueError("La pestaña LOGIN no contiene cuentas de usuario.")
+    return cuentas
+
+
+@st.cache_data(ttl=10, max_entries=8, show_spinner=False)
+def leer_login(archivo_id, hoja, credenciales_json):
+    """Lee LOGIN desde el mismo archivo ACCESOS, sea Google Sheets o .xlsx."""
+    drive = servicio(credenciales_json)
+    archivo = drive.files().get(
+        fileId=archivo_id, fields="id,name,mimeType,size", supportsAllDrives=True
+    ).execute(num_retries=2)
+    if archivo["mimeType"] == SHEET_MIME:
+        sheets = servicio(credenciales_json, "sheets", "v4")
+        metadata = sheets.spreadsheets().get(
+            spreadsheetId=archivo["id"], fields="sheets(properties(title))"
+        ).execute(num_retries=2)
+        titulos = [s["properties"]["title"] for s in metadata.get("sheets", [])]
+        candidatas = [t for t in titulos if normalizar(t) == normalizar(hoja)]
+        if len(candidatas) != 1:
+            raise ValueError(f"No se encontró una pestaña única llamada {hoja} en ACCESOS.")
+        rango = "'" + candidatas[0].replace("'", "''") + "'"
+        filas = sheets.spreadsheets().values().get(
+            spreadsheetId=archivo["id"], range=rango, majorDimension="ROWS",
+            valueRenderOption="FORMATTED_VALUE",
+        ).execute(num_retries=2).get("values", [])
+    elif archivo["mimeType"] == XLSX_MIME or archivo["name"].lower().endswith(".xlsx"):
+        filas = filas_excel(descargar_excel(drive, archivo), hoja)
+    else:
+        raise ValueError("ACCESOS debe ser una hoja de Google o un archivo .xlsx para poder leer LOGIN.")
+    return interpretar_login(filas)
+
+
+def buscar_cuenta_login(cuentas, usuario):
+    """Devuelve una cuenta solo si el usuario coincide con una única fila."""
+    buscado = normalizar(usuario)
+    coincidencias = [c for c in cuentas if normalizar(c.get("usuario", "")) == buscado]
+    return coincidencias[0] if buscado and len(coincidencias) == 1 else None
+
+
+def password_correcta(ingresada, almacenada):
+    """Admite clave actual en texto y SHA-256 explícito como sha256:<hex>."""
+    ingresada, almacenada = str(ingresada), str(almacenada)
+    if not almacenada:
+        return False
+    if almacenada.casefold().startswith("sha256:"):
+        esperado = almacenada.split(":", 1)[1].strip().casefold()
+        calculado = hashlib.sha256(ingresada.encode("utf-8")).hexdigest()
+        return hmac.compare_digest(calculado, esperado)
+    return hmac.compare_digest(ingresada, almacenada)
+
+
+def cuentas_demo():
+    return [{"usuario": "admin", "password": "demo123", "activo": True,
+             "nombre": "Administrador de demostración", "informacion_equipo": "TOTAL",
+             "editar": "SI", "bonificacion": "SI", "rol": "ADMINISTRADOR",
+             "jefe": "", "mesa": ""}]
+
+
+def limpiar_filtros_sesion():
+    for clave in ("filtro_mesa", "filtro_jefe", "filtro_rol", "pagina"):
+        st.session_state.pop(clave, None)
+
+
+def cerrar_sesion():
+    st.session_state.pop("login_usuario", None)
+    limpiar_filtros_sesion()
+
+
+def mostrar_login(cuentas):
+    """Muestra el formulario y devuelve la cuenta vigente; nunca guarda la contraseña en sesión."""
+    usuario_sesion = st.session_state.get("login_usuario", "")
+    if usuario_sesion:
+        cuenta = buscar_cuenta_login(cuentas, usuario_sesion)
+        if cuenta and cuenta.get("activo"):
+            return cuenta
+        cerrar_sesion()
+        st.warning("Tu cuenta está inactiva, ya no existe o está duplicada en LOGIN. Ingresa con una cuenta autorizada.")
+
+    st.title("🔐 Acceso a desempeño")
+    st.caption("Ingresa con las credenciales registradas en la pestaña LOGIN de ACCESOS.")
+    _, centro, _ = st.columns([1, 1.2, 1])
+    with centro:
+        with st.form("formulario_login", clear_on_submit=False):
+            usuario = st.text_input("Usuario", placeholder="Escribe tu usuario", autocomplete="username")
+            password = st.text_input("Contraseña", type="password", placeholder="Escribe tu contraseña", autocomplete="current-password")
+            ingresar = st.form_submit_button("Ingresar", type="primary", use_container_width=True)
+        if ingresar:
+            cuenta = buscar_cuenta_login(cuentas, usuario)
+            if cuenta and cuenta.get("activo") and password_correcta(password, cuenta.get("password", "")):
+                limpiar_filtros_sesion()
+                st.session_state["login_usuario"] = cuenta["usuario"]
+                st.rerun()
+            st.error("No se pudo ingresar. Verifica tus credenciales y consulta si tu cuenta está activa.")
+    return None
+
+
+def aplicar_permisos_equipo(equipo, cuenta):
+    """
+    Aplica el permiso de la columna INFORMACIÓN DEL EQUIPO de LOGIN:
+    TOTAL = todos los equipos; SI = equipo(s) vinculado(s) a PERSONAL;
+    NO = solo la ficha propia cuando es asesor/promotor, nunca el equipo completo.
+    """
+    permiso = normalizar(cuenta.get("informacion_equipo", ""))
+    nombre = str(cuenta.get("nombre", "") or "").strip()
+    usuario = str(cuenta.get("usuario", "") or "").strip()
+    identidad = normalizar(nombre or usuario)
+
+    if permiso == "total":
+        return equipo, "Acceso total a todos los equipos", "total", ""
+
+    if permiso not in {"si", "no"}:
+        return [], "", "", (
+            "La cuenta está activa, pero INFORMACIÓN DEL EQUIPO debe indicar SI, NO o TOTAL. "
+            "Revisa esa columna en la pestaña LOGIN."
+        )
+
+    coincidencias = [
+        c for c in equipo
+        if identidad and normalizar(c.get("nombre", "")) == identidad
+        and c.get("rol") != "SIN ESTRUCTURA"
+    ]
+    if not coincidencias:
+        return [], "", "", (
+            "El valor de PERSONAL en LOGIN no coincide con un nombre de "
+            "ESTRUCTURA DE COLABORADORES. Revisa que esté escrito igual."
+        )
+
+    # NO significa que el usuario no puede consultar a sus compañeros.
+    # Si aparece como asesor/promotor, puede ver únicamente sus propias asignaciones.
+    if permiso == "no":
+        propios = [c for c in coincidencias if c.get("rol") != "JEFE DE CRÉDITO"]
+        if propios:
+            return propios, f"Acceso individual: {nombre or usuario}", "individual", ""
+        return [], "", "individual", (
+            "Tu cuenta está activa, pero INFORMACIÓN DEL EQUIPO está en NO. "
+            "Esta cuenta no tiene permiso para consultar información del equipo."
+        )
+
+    # SI: ubicar los equipos a los que PERSONAL pertenece en la estructura.
+    # Para un jefe se toman sus mesas; para un asesor/promotor, su mesa y jefe asignados.
+    asignaciones = {
+        (clave_mesa(c.get("mesa", "")), normalizar(c.get("jefe", "")))
+        for c in coincidencias
+        if c.get("mesa") and c.get("jefe")
+    }
+    if not asignaciones:
+        return [], "", "", (
+            "No se encontraron mesa y jefe asignados a esta cuenta. "
+            "Revisa ESTRUCTURA DE COLABORADORES."
+        )
+
+    autorizados = [
+        c for c in equipo
+        if (clave_mesa(c.get("mesa", "")), normalizar(c.get("jefe", ""))) in asignaciones
+    ]
+    if not autorizados:
+        return [], "", "", "No se encontraron colaboradores para los equipos asignados a esta cuenta."
+
+    jefes = sorted({c.get("jefe", "") for c in coincidencias if c.get("rol") == "JEFE DE CRÉDITO" and c.get("jefe")})
+    if jefes:
+        descripcion = "Jefe de crédito: " + ", ".join(jefes)
+    else:
+        mesas = sorted({c.get("mesa", "") for c in coincidencias if c.get("mesa")})
+        descripcion = f"Equipo asignado a {nombre or usuario}: " + ", ".join(mesas)
+    return autorizados, descripcion, "equipo", ""
+
+
+def error_login(error):
+    if isinstance(error, HttpError) and error.resp.status in (401, 403, 404):
+        return "No se puede leer ACCESOS. Comparte el archivo con la cuenta de servicio como Lector y revisa el ID."
+    if isinstance(error, ValueError):
+        return str(error)
+    return "No se pudo verificar la pestaña LOGIN. Revisa la conexión, los permisos y vuelve a intentarlo."
+
+
 def servicio(credenciales_json, api="drive", version="v3"):
     credenciales = Credentials.from_service_account_info(
         json.loads(credenciales_json), scopes=SCOPE
@@ -497,7 +738,8 @@ def configuracion():
             str(opciones.get("hoja_desempeno", "DESEMPEÑO")),
             str(opciones.get("estructura_carpeta_id", ESTRUCTURA_CARPETA_PREDETERMINADA)),
             str(opciones.get("accesos_id", ACCESOS_PREDETERMINADO)),
-            str(opciones.get("hoja_colaboradores", "ESTRUCTURA DE COLABORADORES")))
+            str(opciones.get("hoja_colaboradores", "ESTRUCTURA DE COLABORADORES")),
+            str(opciones.get("hoja_login", LOGIN_HOJA_PREDETERMINADA)))
 
 
 def foto_demo(indice):
@@ -549,34 +791,75 @@ def mostrar_foto(persona, demo, credenciales_json, ancho="stretch"):
 
 def main():
     st.set_page_config(page_title="Desempeño · Colaboradores", page_icon="👥", layout="wide")
-    st.title("👥 Desempeño del equipo")
-    st.caption("Cada mesa es un equipo a cargo de un jefe de crédito, con asesores y promotores.")
     try:
         (carpeta_id, credenciales, demo, productividad_id, hoja_desempeno,
-         estructura_carpeta_id, accesos_id, hoja_colaboradores) = configuracion()
+         estructura_carpeta_id, accesos_id, hoja_colaboradores, hoja_login) = configuracion()
     except Exception:
         st.error("La configuración no es válida. Revisa Settings → Secrets.")
         return
     if not demo and not credenciales:
-        st.info("Falta conectar Google Drive. Los pasos están en README.md, dentro del proyecto descargado.")
-        st.write("**Para conectar la carpeta:**")
-        st.write("1. Crea una cuenta de servicio en Google Cloud y habilita Google Drive API.")
-        st.write("2. Comparte la carpeta con el correo de esa cuenta, con permiso de Lector.")
+        st.title("🔐 Acceso a desempeño")
+        st.info("Falta conectar Google Drive para validar los usuarios de la pestaña LOGIN.")
+        st.write("**Para conectar la aplicación:**")
+        st.write("1. Habilita Google Drive API y Google Sheets API en Google Cloud.")
+        st.write("2. Comparte ACCESOS, PRODUCTIVIDAD y la carpeta de fotos con la cuenta de servicio, como Lector.")
         st.write("3. Coloca las credenciales en Settings → Secrets de Streamlit.")
-        st.caption("La clave privada se coloca en Secrets; no se sube a GitHub.")
+        st.caption("No subas la clave privada a GitHub.")
         return
     cred_json = json.dumps(credenciales or {}, sort_keys=True)
+    if demo:
+        cuentas = cuentas_demo()
+    else:
+        try:
+            cuentas = leer_login(accesos_id, hoja_login, cred_json)
+        except Exception as error:
+            st.title("🔐 Acceso a desempeño")
+            st.error("No se puede mostrar el formulario porque no fue posible validar LOGIN.")
+            st.caption(error_login(error))
+            return
+    cuenta = mostrar_login(cuentas)
+    if not cuenta:
+        return
+
+    st.title("👥 Desempeño del equipo")
+    st.caption("Cada mesa es un equipo a cargo de un jefe de crédito, con asesores y promotores.")
     with st.sidebar:
+        st.subheader("Sesión")
+        st.caption(f"Usuario: {cuenta.get('usuario', '')}")
+        st.caption(f"Información del equipo: {cuenta.get('informacion_equipo', 'NO') or 'NO'}")
+        if st.button("Cerrar sesión", use_container_width=True):
+            cerrar_sesion()
+            st.rerun()
+        st.divider()
         st.subheader("Directorio")
         if st.button("Actualizar ahora"):
             listar_fotos.clear()
             leer_desempeno.clear()
             leer_estructura.clear()
+            leer_login.clear()
         automatico = st.checkbox("Actualizar cada minuto", value=True)
-        st.caption("La actualización automática funciona mientras esta página está abierta y activa.")
+        st.caption("La actualización automática funciona mientras esta página está abierta y activa. El estado de LOGIN se vuelve a validar periódicamente.")
         st.caption("La estructura se toma de ACCESOS. Las fotos se relacionan por nombre.")
-    @st.fragment(run_every=60 if automatico else None)
+    @st.fragment(run_every=15 if automatico else None)
     def galeria():
+        # Revalida el estado de la cuenta periódicamente; ante un fallo de verificación,
+        # la aplicación cierra la sesión por seguridad en lugar de mantener el acceso.
+        if demo:
+            cuentas_actuales = cuentas_demo()
+        else:
+            try:
+                cuentas_actuales = leer_login(accesos_id, hoja_login, cred_json)
+            except Exception:
+                cerrar_sesion()
+                st.error("No se pudo verificar tu acceso. Por seguridad, la sesión se cerró.")
+                st.rerun()
+                return
+        cuenta_actual = buscar_cuenta_login(cuentas_actuales, st.session_state.get("login_usuario", ""))
+        if not cuenta_actual or not cuenta_actual.get("activo"):
+            cerrar_sesion()
+            st.warning("Tu cuenta fue desactivada o dejó de estar autorizada. Inicia sesión nuevamente.")
+            st.rerun()
+            return
         if demo:
             st.info("DEMOSTRACIÓN · Nombres e imágenes ficticios; no se está leyendo Drive.")
             fotos = [{"id": str(i), "colaborador": n} for i, n in enumerate(
@@ -622,6 +905,12 @@ def main():
         if not equipo:
             st.info("Todavía no hay colaboradores para mostrar. Revisa los avisos, añade personas a ESTRUCTURA DE COLABORADORES o coloca fotos con sus nombres en la carpeta de fotos.")
             return
+        equipo, descripcion_acceso, tipo_acceso, error_acceso = aplicar_permisos_equipo(equipo, cuenta_actual)
+        if not equipo:
+            st.error(error_acceso or "No hay información asignada a esta cuenta.")
+            st.caption("Un administrador debe revisar el usuario en LOGIN y su relación con ESTRUCTURA DE COLABORADORES.")
+            return
+        st.caption("Acceso autorizado · " + descripcion_acceso)
         nombres = [normalizar(f["colaborador"]) for f in fotos]
         if len(nombres) != len(set(nombres)):
             st.warning("Hay fotos con el mismo nombre. No se asignan a la estructura hasta resolver el duplicado.")
