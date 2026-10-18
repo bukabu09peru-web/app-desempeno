@@ -1,4 +1,4 @@
-"""Primera etapa: fotos y nombres de colaboradores desde Google Drive."""
+"""Fotos de Drive y desempeño por colaborador desde PRODUCTIVIDAD."""
 import io
 import json
 import unicodedata
@@ -12,9 +12,17 @@ from googleapiclient.http import MediaIoBaseDownload
 from PIL import Image, ImageOps
 
 CARPETA_PREDETERMINADA = "1IZXOH9CeQk1XjNq3uvwWl2TkoKMNihcj"
-SCOPE = ["https://www.googleapis.com/auth/drive.readonly"]
+PRODUCTIVIDAD_PREDETERMINADA = "1G4lAKm4fxV6ZsPoKyN49Kt5-Ub__hCm6YTvR4GBgIGw"
+SCOPE = ["https://www.googleapis.com/auth/drive.readonly",
+         "https://www.googleapis.com/auth/spreadsheets.readonly"]
 FORMATOS = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 MAX_BYTES = 10 * 1024 * 1024
+ORDEN_ORIGINAL = ["MESA", "ASESOR", "BOLSAS MEDIO DIA", "BOLSAS CIERRE",
+                  "CLIENTES RECUPERADO", "CLIENTES NUEVO", "NO RENOVADOS",
+                  "VARIACION CLIENTES", "VARIACIÓN DE CARTERA", "RECUPERACIÓN DE EFECTIVO",
+                  "RECUPERACIÓN DE MORA (30%)", "RECUPERACION MORA AGOSTO", "MORA SEPTIEMBRE"]
+NOMBRES_ASESOR = {"asesor", "asesores", "colaborador", "colaboradores", "personal",
+                  "nombre", "nombre completo"}
 
 
 def nombre_colaborador(archivo):
@@ -23,15 +31,142 @@ def nombre_colaborador(archivo):
 
 
 def normalizar(texto):
-    return "".join(c for c in unicodedata.normalize("NFD", texto.casefold())
-                   if unicodedata.category(c) != "Mn")
+    texto = str(texto).replace("_", " ").replace("-", " ")
+    return " ".join("".join(c for c in unicodedata.normalize("NFD", texto.casefold())
+                            if unicodedata.category(c) != "Mn").split())
 
 
-def servicio(credenciales_json):
+def servicio(credenciales_json, api="drive", version="v3"):
     credenciales = Credentials.from_service_account_info(
         json.loads(credenciales_json), scopes=SCOPE
     )
-    return build("drive", "v3", credentials=credenciales, cache_discovery=False)
+    return build(api, version, credentials=credenciales, cache_discovery=False)
+
+
+def interpretar_desempeno(filas):
+    """Detecta el encabezado y conserva los valores tal como se ven en Sheets."""
+    if not filas:
+        return [], []
+    inicio = None
+    for numero, fila in enumerate(filas[:10]):
+        if any(normalizar(v) in NOMBRES_ASESOR for v in fila):
+            inicio = numero
+            break
+    if inicio is None:
+        raise ValueError("No se encontró una columna ASESOR, COLABORADOR, PERSONAL o NOMBRE en las primeras 10 filas de DESEMPEÑO.")
+    cabecera = [str(v).strip() for v in filas[inicio]]
+    avisos = []
+    # El script original explica que A está mal rotulada CLIENTES NUEVO,
+    # mientras que B es ASESOR y los indicadores ocupan C:M.
+    if (len(cabecera) >= 13 and normalizar(cabecera[0]) == "clientes nuevo"
+            and normalizar(cabecera[1]) in NOMBRES_ASESOR):
+        cabecera[:13] = ORDEN_ORIGINAL
+        avisos.append("Se interpretó A:M con el orden de tu script original porque la primera columna está rotulada CLIENTES NUEVO y contiene la mesa.")
+    columna_nombre = next(i for i, v in enumerate(cabecera) if normalizar(v) in NOMBRES_ASESOR)
+    columna_mesa = next((i for i, v in enumerate(cabecera) if normalizar(v) in {"mesa", "mesas"}), None)
+    resultado = []
+    for indice, fila in enumerate(filas[inicio+1:], start=inicio+2):
+        nombre = str(fila[columna_nombre]).strip() if columna_nombre < len(fila) else ""
+        if not nombre:
+            continue
+        mesa = str(fila[columna_mesa]).strip() if columna_mesa is not None and columna_mesa < len(fila) else ""
+        indicadores, repetidos = {}, {}
+        for i, titulo in enumerate(cabecera):
+            if i in (columna_nombre, columna_mesa) or not titulo:
+                continue
+            clave = normalizar(titulo)
+            repetidos[clave] = repetidos.get(clave, 0)+1
+            etiqueta = titulo if repetidos[clave] == 1 else f"{titulo} ({repetidos[clave]})"
+            valor = fila[i] if i < len(fila) else ""
+            indicadores[etiqueta] = "—" if valor is None or str(valor).strip() == "" else str(valor)
+        resultado.append({"nombre": nombre, "mesa": mesa, "fila": indice, "indicadores": indicadores})
+    return resultado, avisos
+
+
+def coincide_abreviado(a, b):
+    return a == b or a.startswith(b + " ") or b.startswith(a + " ")
+
+
+def buscar_desempeno(nombre, registros, nombres_fotos):
+    buscado = normalizar(nombre)
+    exactos = [r for r in registros if normalizar(r["nombre"]) == buscado]
+    if exactos:
+        return exactos, "exacta"
+    candidatos = [r for r in registros if coincide_abreviado(buscado, normalizar(r["nombre"]))]
+    nombres = {normalizar(r["nombre"]) for r in candidatos}
+    if len(nombres) != 1:
+        return [], "ambigua" if nombres else "sin datos"
+    nombre_origen = next(iter(nombres))
+    posibles_fotos = {normalizar(n) for n in nombres_fotos if coincide_abreviado(normalizar(n), nombre_origen)}
+    if len(posibles_fotos) != 1:
+        return [], "ambigua"
+    return candidatos, "abreviada"
+
+
+@st.cache_data(ttl=60, max_entries=8, show_spinner=False)
+def leer_desempeno(archivo_id, hoja, credenciales_json):
+    sheets = servicio(credenciales_json, "sheets", "v4")
+    metadata = sheets.spreadsheets().get(
+        spreadsheetId=archivo_id, fields="sheets(properties(title))"
+    ).execute(num_retries=2)
+    titulos = [s["properties"]["title"] for s in metadata.get("sheets", [])]
+    candidatas = [t for t in titulos if normalizar(t) == normalizar(hoja)]
+    if len(candidatas) != 1:
+        raise ValueError("No se encontró una pestaña única llamada " + hoja +
+                         ". Revisa su nombre; puede configurarse como hoja_desempeno en la sección [app] de Secrets.")
+    rango = "'" + candidatas[0].replace("'", "''") + "'"
+    respuesta = sheets.spreadsheets().values().get(
+        spreadsheetId=archivo_id, range=rango, majorDimension="ROWS",
+        valueRenderOption="FORMATTED_VALUE",
+    ).execute(num_retries=2)
+    return interpretar_desempeno(respuesta.get("values", []))
+
+
+def error_productividad(error):
+    if isinstance(error, HttpError):
+        if error.resp.status == 404:
+            return "Comparte el archivo PRODUCTIVIDAD como Lector con la cuenta lector-colaboradores y revisa su ID."
+        if error.resp.status in (401, 403):
+            return "Habilita Google Sheets API en el mismo proyecto y comparte PRODUCTIVIDAD como Lector con la cuenta lector-colaboradores."
+        if error.resp.status == 429:
+            return "Se alcanzó la cuota de Sheets. Espera un minuto y pulsa Actualizar ahora."
+        if error.resp.status == 400:
+            return "El archivo debe ser una Hoja de cálculo de Google y tener la pestaña DESEMPEÑO. Si es un Excel, conviértelo a Google Sheets y configura el ID de la copia en productividad_id."
+    return str(error) if isinstance(error, ValueError) else "No se pudo consultar PRODUCTIVIDAD. Revisa la conexión y vuelve a actualizar."
+
+
+def mostrar_indicadores(registros, tipo, archivo_id):
+    if not registros:
+        st.caption("Nombre ambiguo: haz coincidir el nombre completo de la foto y el de la hoja." if tipo == "ambigua"
+                   else "Sin desempeño asociado. Revisa que el nombre coincida con la hoja.")
+        return
+    if len(registros) > 1:
+        st.caption("Hay varios registros para este nombre; selecciona cuál consultar.")
+        indice = st.selectbox("Registro de desempeño", list(range(len(registros))), index=None,
+                              placeholder="Selecciona una mesa o fila",
+                              format_func=lambda i: f"{registros[i]['mesa'] or 'Sin mesa'} · fila {registros[i]['fila']}",
+                              key="registro_"+archivo_id)
+        if indice is None:
+            return
+        registro = registros[indice]
+    else:
+        registro = registros[0]
+    if tipo == "abreviada":
+        st.caption("Coincidencia por nombre abreviado: " + registro["nombre"])
+    if registro["mesa"]:
+        st.text("Mesa: " + registro["mesa"])
+    indicadores = registro["indicadores"]
+    for etiqueta, aliases in [("Bolsas al cierre", {"bolsas cierre"}),
+                               ("Clientes nuevos", {"clientes nuevo", "clientes nuevos"}),
+                               ("Clientes recuperados", {"clientes recuperado", "clientes recuperados"})]:
+        valor = next((v for k, v in indicadores.items() if normalizar(k) in aliases), "—")
+        st.metric(etiqueta, valor)
+    with st.expander("Ver todos los indicadores"):
+        if indicadores:
+            st.dataframe([{"Indicador": k, "Valor": v} for k, v in indicadores.items()],
+                         hide_index=True, width="stretch")
+        else:
+            st.info("La fila tiene nombre, pero no tiene columnas de indicadores.")
 
 
 @st.cache_data(ttl=60, max_entries=8, show_spinner=False)
@@ -105,7 +240,9 @@ def configuracion():
     opciones = valores.get("app", {})
     return (str(opciones.get("folder_id", CARPETA_PREDETERMINADA)),
             valores.get("gcp_service_account"),
-            bool(opciones.get("demo_mode", False)))
+            bool(opciones.get("demo_mode", False)),
+            str(opciones.get("productividad_id", PRODUCTIVIDAD_PREDETERMINADA)),
+            str(opciones.get("hoja_desempeno", "DESEMPEÑO")))
 
 
 def foto_demo(indice):
@@ -123,10 +260,10 @@ def foto_demo(indice):
 
 def main():
     st.set_page_config(page_title="Desempeño · Colaboradores", page_icon="👥", layout="wide")
-    st.title("👥 Colaboradores")
-    st.caption("Desempeño · Directorio del equipo")
+    st.title("👥 Desempeño del equipo")
+    st.caption("Fotos de colaboradores y datos de PRODUCTIVIDAD")
     try:
-        carpeta_id, credenciales, demo = configuracion()
+        carpeta_id, credenciales, demo, productividad_id, hoja_desempeno = configuracion()
     except Exception:
         st.error("La configuración no es válida. Revisa Settings → Secrets.")
         return
@@ -143,6 +280,7 @@ def main():
         st.subheader("Directorio")
         if st.button("Actualizar ahora"):
             listar_fotos.clear()
+            leer_desempeno.clear()
         automatico = st.checkbox("Actualizar cada minuto", value=True)
         st.caption("La actualización automática funciona mientras esta página está abierta y activa.")
         st.caption("Nombre mostrado: nombre de la foto, sin la extensión.")
@@ -153,12 +291,28 @@ def main():
             fotos = [{"id": str(i), "colaborador": n} for i, n in enumerate(
                 ["Ana Ejemplo", "Carlos Ejemplo", "María Ejemplo"])]
             omitidas = 0
+            registros, avisos = interpretar_desempeno([
+                ORDEN_ORIGINAL,
+                ["MESA DEMO", "Ana Ejemplo", "5", "12", "3", "4", "1", "3", "S/ 1,000.00", "S/ 700.00", "30%", "S/ 100.00", "S/ 200.00"],
+                ["MESA DEMO", "Carlos Ejemplo", "6", "15", "4", "2", "0", "2", "S/ 1,500.00", "S/ 900.00", "25%", "S/ 150.00", "S/ 250.00"],
+                ["MESA DEMO", "María Ejemplo", "7", "18", "5", "3", "0", "3", "S/ 2,000.00", "S/ 800.00", "40%", "S/ 120.00", "S/ 300.00"],
+            ])
+            fallo_desempeno = False
         else:
             try:
                 fotos, omitidas = listar_fotos(carpeta_id, cred_json)
             except Exception as error:
                 st.error(error_amigable(error))
                 return
+            try:
+                registros, avisos = leer_desempeno(productividad_id, hoja_desempeno, cred_json)
+                fallo_desempeno = False
+            except Exception as error:
+                registros, avisos = [], []
+                fallo_desempeno = True
+                st.warning("Las fotos están disponibles, pero falta el desempeño. " + error_productividad(error))
+        for aviso in avisos:
+            st.info(aviso)
         st.metric("Fotos de colaboradores", len(fotos))
         if omitidas:
             st.warning(f"Hay {omitidas} imágenes con formato no compatible. Usa JPG, PNG, WEBP o GIF.")
@@ -168,6 +322,9 @@ def main():
         nombres = [normalizar(f["colaborador"]) for f in fotos]
         if len(nombres) != len(set(nombres)):
             st.warning("Hay fotos con el mismo nombre. Cada archivo se muestra como una tarjeta; revisa si hay duplicados.")
+        if not fallo_desempeno:
+            vinculados = sum(bool(buscar_desempeno(f["colaborador"], registros, [p["colaborador"] for p in fotos])[0]) for f in fotos)
+            st.caption(f"{vinculados} de {len(fotos)} fotos tienen coincidencia con {hoja_desempeno}.")
         texto = st.text_input("Buscar por nombre", placeholder="Escribe el nombre de un colaborador")
         visibles = [f for f in fotos if normalizar(texto) in normalizar(f["colaborador"])]
         if not visibles:
@@ -192,6 +349,11 @@ def main():
                     except Exception:
                         st.warning("No se pudo cargar esta foto. Comprueba el formato, tamaño y permisos.")
                     st.text(archivo["colaborador"])
+                    if fallo_desempeno:
+                        st.caption("Desempeño no disponible: revisa el aviso de conexión.")
+                    else:
+                        registros_persona, tipo = buscar_desempeno(archivo["colaborador"], registros, [p["colaborador"] for p in fotos])
+                        mostrar_indicadores(registros_persona, tipo, archivo["id"])
         st.caption("Una foto por colaborador. La galería consulta los archivos ubicados directamente en la carpeta; no recorre subcarpetas ni accesos directos.")
     galeria()
 
