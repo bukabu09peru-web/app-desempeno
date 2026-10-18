@@ -449,9 +449,10 @@ def mostrar_login(cuentas):
 
 def aplicar_permisos_equipo(equipo, cuenta):
     """
-    Aplica el permiso de la columna INFORMACIÓN DEL EQUIPO de LOGIN:
-    TOTAL = todos los equipos; SI = equipo(s) vinculado(s) a PERSONAL;
-    NO = solo la ficha propia cuando es asesor/promotor, nunca el equipo completo.
+    El alcance se determina combinando LOGIN con ESTRUCTURA DE COLABORADORES:
+    TOTAL = todos los equipos; SI = equipo completo solo si PERSONAL figura como
+    JEFE DE CRÉDITO; SI para asesores/promotores = solo su propia ficha;
+    NO = solo su propia ficha, independientemente del cargo.
     """
     permiso = normalizar(cuenta.get("informacion_equipo", ""))
     nombre = str(cuenta.get("nombre", "") or "").strip()
@@ -478,43 +479,44 @@ def aplicar_permisos_equipo(equipo, cuenta):
             "ESTRUCTURA DE COLABORADORES. Revisa que esté escrito igual."
         )
 
-    # NO significa que el usuario no puede consultar a sus compañeros.
-    # Si aparece como asesor/promotor, puede ver únicamente sus propias asignaciones.
+    # NO siempre limita al registro propio, incluso si la persona es jefe.
     if permiso == "no":
-        propios = [c for c in coincidencias if c.get("rol") != "JEFE DE CRÉDITO"]
-        if propios:
-            return propios, f"Acceso individual: {nombre or usuario}", "individual", ""
-        return [], "", "individual", (
-            "Tu cuenta está activa, pero INFORMACIÓN DEL EQUIPO está en NO. "
-            "Esta cuenta no tiene permiso para consultar información del equipo."
-        )
+        return coincidencias, f"Acceso individual: {nombre or usuario}", "individual", ""
 
-    # SI: ubicar los equipos a los que PERSONAL pertenece en la estructura.
-    # Para un jefe se toman sus mesas; para un asesor/promotor, su mesa y jefe asignados.
-    asignaciones = {
+    # SI no convierte a un asesor/promotor en jefe. La estructura decide el rol.
+    jefaturas = [
+        c for c in coincidencias
+        if normalizar(c.get("rol", "")) == normalizar("JEFE DE CRÉDITO")
+        and c.get("mesa") and c.get("jefe")
+    ]
+    if not jefaturas:
+        propios = [
+            c for c in coincidencias
+            if normalizar(c.get("rol", "")) in {
+                normalizar("ASESOR"), normalizar("PROMOTOR"),
+                normalizar("COLABORADOR"), normalizar("PERSONAL")
+            }
+        ]
+        if not propios:
+            # Para cualquier rol que no sea jefe, la opción segura es no ampliar
+            # el acceso al equipo por el mero hecho de que LOGIN diga SI.
+            propios = coincidencias
+        return propios, f"Acceso individual: {nombre or usuario}", "individual", ""
+
+    # Solo las mesas en las que la estructura registra a esta persona como jefe.
+    asignaciones_jefe = {
         (clave_mesa(c.get("mesa", "")), normalizar(c.get("jefe", "")))
-        for c in coincidencias
-        if c.get("mesa") and c.get("jefe")
+        for c in jefaturas
     }
-    if not asignaciones:
-        return [], "", "", (
-            "No se encontraron mesa y jefe asignados a esta cuenta. "
-            "Revisa ESTRUCTURA DE COLABORADORES."
-        )
-
     autorizados = [
         c for c in equipo
-        if (clave_mesa(c.get("mesa", "")), normalizar(c.get("jefe", ""))) in asignaciones
+        if (clave_mesa(c.get("mesa", "")), normalizar(c.get("jefe", ""))) in asignaciones_jefe
     ]
     if not autorizados:
-        return [], "", "", "No se encontraron colaboradores para los equipos asignados a esta cuenta."
+        return [], "", "", "No se encontraron colaboradores para las mesas asignadas a este jefe."
 
-    jefes = sorted({c.get("jefe", "") for c in coincidencias if c.get("rol") == "JEFE DE CRÉDITO" and c.get("jefe")})
-    if jefes:
-        descripcion = "Jefe de crédito: " + ", ".join(jefes)
-    else:
-        mesas = sorted({c.get("mesa", "") for c in coincidencias if c.get("mesa")})
-        descripcion = f"Equipo asignado a {nombre or usuario}: " + ", ".join(mesas)
+    mesas = sorted({c.get("mesa", "") for c in jefaturas if c.get("mesa")})
+    descripcion = f"Equipo a cargo de {nombre or usuario}: " + ", ".join(mesas)
     return autorizados, descripcion, "equipo", ""
 
 
@@ -821,8 +823,8 @@ def main():
     if not cuenta:
         return
 
-    st.title("👥 Desempeño del equipo")
-    st.caption("Cada mesa es un equipo a cargo de un jefe de crédito, con asesores y promotores.")
+    st.title("📊 Desempeño")
+    st.caption("La información visible depende de tu cuenta y de la estructura de colaboradores.")
     with st.sidebar:
         st.subheader("Sesión")
         st.caption(f"Usuario: {cuenta.get('usuario', '')}")
@@ -901,16 +903,43 @@ def main():
             st.info(aviso)
         if omitidas:
             st.warning(f"Hay {omitidas} imágenes con formato no compatible. Usa JPG, PNG, WEBP o GIF.")
-        equipo = construir_equipo(fotos, estructura)
-        if not equipo:
+        equipo_completo = construir_equipo(fotos, estructura)
+        if not equipo_completo:
             st.info("Todavía no hay colaboradores para mostrar. Revisa los avisos, añade personas a ESTRUCTURA DE COLABORADORES o coloca fotos con sus nombres en la carpeta de fotos.")
             return
-        equipo, descripcion_acceso, tipo_acceso, error_acceso = aplicar_permisos_equipo(equipo, cuenta_actual)
+        # Mantiene los nombres completos de toda la estructura solo para detectar
+        # coincidencias ambiguas; los registros que se muestran siguen limitados
+        # por aplicar_permisos_equipo.
+        nombres_equipo_completo = [c["nombre"] for c in equipo_completo]
+        equipo, descripcion_acceso, tipo_acceso, error_acceso = aplicar_permisos_equipo(equipo_completo, cuenta_actual)
         if not equipo:
             st.error(error_acceso or "No hay información asignada a esta cuenta.")
             st.caption("Un administrador debe revisar el usuario en LOGIN y su relación con ESTRUCTURA DE COLABORADORES.")
             return
         st.caption("Acceso autorizado · " + descripcion_acceso)
+
+        # Los asesores/promotores (y cualquier cuenta limitada) solo ven su ficha.
+        # Se sale antes de crear filtros, resumen de equipos o tarjetas de compañeros.
+        if tipo_acceso == "individual":
+            st.subheader("Mi desempeño")
+            st.caption("Esta cuenta solo puede consultar su propia información.")
+            nombres_propios = nombres_equipo_completo
+            for persona in equipo:
+                with st.container(border=True):
+                    columnas_personal = st.columns([1, 3])
+                    with columnas_personal[0]:
+                        mostrar_foto(persona, demo, cred_json, ancho=150)
+                    with columnas_personal[1]:
+                        st.subheader(persona["nombre"])
+                        st.caption(persona["rol"].title())
+                        if fallo_desempeno:
+                            st.warning("Tu desempeño no está disponible en este momento. Revisa el aviso de conexión.")
+                        else:
+                            registros_persona, tipo_nombre = buscar_desempeno(
+                                persona["nombre"], registros, nombres_propios, persona["mesa"])
+                            mostrar_indicadores(registros_persona, tipo_nombre, persona["id"])
+            return
+
         nombres = [normalizar(f["colaborador"]) for f in fotos]
         if len(nombres) != len(set(nombres)):
             st.warning("Hay fotos con el mismo nombre. No se asignan a la estructura hasta resolver el duplicado.")
@@ -947,7 +976,7 @@ def main():
                            "Integrantes": len({normalizar(c["nombre"]) for c in g["integrantes"]})} for g in grupos],
                          hide_index=True, width="stretch")
             st.caption("Esta estructura muestra el equipo completo de cada jefe. Los filtros de rol y nombre se aplican al desempeño de abajo.")
-        nombres_equipo = [c["nombre"] for c in equipo]
+        nombres_equipo = nombres_equipo_completo
         tabla = tabla_desempeno(visibles, registros, nombres_equipo)
         con_desempeno = {normalizar(f["Colaborador"]) for f in tabla if f["Desempeño"] == "Disponible"}
         resumen = st.columns(4)
