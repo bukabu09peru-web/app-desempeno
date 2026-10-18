@@ -1,11 +1,14 @@
 """Equipo por mesa y jefe, fotos de Drive y desempeño de PRODUCTIVIDAD."""
 import io
 import json
+import base64
+import html
 import hashlib
 import hmac
 import re
 import unicodedata
 from pathlib import Path
+from urllib.parse import quote
 
 import streamlit as st
 from google.oauth2.service_account import Credentials
@@ -632,17 +635,120 @@ def error_productividad(error):
     return str(error) if isinstance(error, ValueError) else "No se pudo consultar PRODUCTIVIDAD. Revisa la conexión y vuelve a actualizar."
 
 
+def numero_indicador(valor):
+    """Convierte porcentajes y cantidades visibles a número para aplicar semáforos."""
+    texto = str(valor or "").strip().replace("S/", "").replace("%", "").replace(" ", "")
+    if not texto or texto in {"—", "-", "N/A", "NA"}:
+        return None
+    # Conserva signo y decimal. En formatos 1,234.50 elimina separadores de miles.
+    if "," in texto and "." in texto:
+        texto = texto.replace(",", "")
+    elif "," in texto:
+        trozos = texto.split(",")
+        if len(trozos) == 2 and len(trozos[1]) in (1, 2):
+            texto = ".".join(trozos)
+        else:
+            texto = "".join(trozos)
+    coincidencia = re.search(r"[-+]?\d+(?:\.\d+)?", texto)
+    if not coincidencia:
+        return None
+    try:
+        return float(coincidencia.group(0))
+    except ValueError:
+        return None
+
+
+def estilo_indicador(nombre, valor):
+    """Devuelve fondo, borde, texto y estado según las metas acordadas."""
+    clave = normalizar(nombre)
+    numero = numero_indicador(valor)
+    verde = ("#DCFCE7", "#22C55E", "#166534")
+    naranja = ("#FFEDD5", "#F97316", "#9A3412")
+    rojo = ("#FEE2E2", "#EF4444", "#991B1B")
+    rojo_fuerte = ("#FECACA", "#DC2626", "#7F1D1D")
+    rojo_oscuro = ("#FCA5A5", "#B91C1C", "#7F1D1D")
+    amarillo = ("#FEF3C7", "#F59E0B", "#92400E")
+    neutro = ("#F8FAFC", "#CBD5E1", "#334155")
+
+    if numero is None:
+        return (*neutro, "Sin dato")
+    if "variacion" in clave and "cliente" in clave:
+        return (*verde, "Variación positiva") if numero > 0 else (*rojo, "Variación no positiva")
+    if "bolsas medio dia" in clave or "bolsas mediodia" in clave:
+        if numero >= 69:
+            return (*verde, "Meta alcanzada · ≥ 69%")
+        if numero > 64:
+            return (*naranja, "Atención · 65–68.99%")
+        return (*rojo, "Bajo mínimo · ≤ 64%")
+    es_cierre = ("cierre bolsa" in clave or "bolsas cierre" in clave or
+                 ("bolsas" in clave and "cierre" in clave))
+    if es_cierre:
+        if numero >= 95:
+            return (*verde, "Meta alcanzada · ≥ 95%")
+        if numero >= 90:
+            return (*amarillo, "Cerca de la meta · 90–94.99%")
+        if numero >= 80:
+            return (*naranja, "Requiere mejora · 80–89.99%")
+        if numero >= 70:
+            return (*rojo, "Bajo · 70–79.99%")
+        return (*rojo_oscuro, "Crítico · < 70%")
+    return (*neutro, "Indicador")
+
+
+def prioridad_indicador(nombre):
+    clave = normalizar(nombre)
+    if "bolsas medio dia" in clave or "bolsas mediodia" in clave:
+        return 0
+    if "cierre bolsa" in clave or "bolsas cierre" in clave or ("bolsas" in clave and "cierre" in clave):
+        return 1
+    if "variacion" in clave and "cliente" in clave:
+        return 2
+    if "clientes nuevo" in clave:
+        return 3
+    if "clientes recuperado" in clave:
+        return 4
+    return 10
+
+
+def inyectar_estilos_dashboard():
+    st.markdown("""
+    <style>
+      .kpi-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(185px,1fr)); gap:12px; width:100%; margin:10px 0 20px; }
+      .kpi-card { border:1px solid; border-radius:16px; padding:16px 17px 14px; min-height:112px; box-sizing:border-box; box-shadow:0 2px 8px rgba(15,23,42,.045); }
+      .kpi-label { font-size:.79rem; font-weight:650; letter-spacing:.025em; text-transform:uppercase; line-height:1.35; opacity:.9; overflow-wrap:anywhere; }
+      .kpi-value { font-size:1.8rem; font-weight:750; line-height:1.25; margin-top:9px; overflow-wrap:anywhere; }
+      .kpi-status { font-size:.72rem; margin-top:8px; line-height:1.3; opacity:.9; }
+      .person-card { border:1px solid #E2E8F0; border-radius:18px; background:#FFFFFF; padding:14px; text-align:center; margin-bottom:12px; box-shadow:0 3px 12px rgba(15,23,42,.06); min-height:260px; }
+      .person-photo-link { display:block; width:100%; max-width:205px; margin:0 auto 12px; border-radius:14px; overflow:hidden; border:2px solid transparent; }
+      .person-photo-link:hover { border-color:#14B8A6; }
+      .person-photo-link img { display:block; width:100%; aspect-ratio:1/1; object-fit:cover; transition:transform .18s ease; }
+      .person-photo-link:hover img { transform:scale(1.035); }
+      .person-name { color:#0F172A; font-size:1rem; font-weight:750; line-height:1.3; margin:7px 0 5px; overflow-wrap:anywhere; }
+      .person-meta { color:#64748B; font-size:.82rem; margin-bottom:8px; }
+      .person-open { color:#0F766E; font-size:.8rem; font-weight:700; text-decoration:none; }
+      .team-banner { border-radius:14px; padding:12px 16px; margin:16px 0 10px; background:linear-gradient(110deg,#F0FDFA,#F8FAFC); border:1px solid #CCFBF1; color:#134E4A; }
+      .profile-header { border:1px solid #E2E8F0; border-radius:20px; padding:22px; text-align:center; background:linear-gradient(160deg,#FFFFFF,#F8FAFC); box-shadow:0 3px 14px rgba(15,23,42,.05); margin:8px 0 20px; }
+      .profile-header img { width:128px; height:128px; object-fit:cover; border-radius:22px; border:3px solid #CCFBF1; }
+      .profile-title { color:#0F172A; font-size:1.65rem; font-weight:800; margin:12px 0 4px; line-height:1.2; }
+      .profile-subtitle { color:#64748B; margin:0 0 8px; font-size:.95rem; }
+      .profile-chip { display:inline-block; background:#F1F5F9; color:#334155; border:1px solid #E2E8F0; border-radius:999px; padding:5px 10px; font-size:.8rem; margin:3px; }
+      @media (max-width:600px) { .kpi-grid { grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; } .kpi-card { padding:12px; min-height:100px; } .kpi-value { font-size:1.35rem; } }
+    </style>
+    """, unsafe_allow_html=True)
+
+
 def mostrar_indicadores(registros, tipo, archivo_id):
+    """Muestra los indicadores como tarjetas de dashboard, ordenadas y con semáforos."""
     if not registros:
         st.caption("Nombre ambiguo: haz coincidir el nombre completo de la foto y el de la hoja." if tipo == "ambigua"
                    else "Sin desempeño asociado a esta persona y mesa. Revisa el nombre en la hoja.")
         return
     if len(registros) > 1:
-        st.caption("Hay varios registros para este nombre; selecciona cuál consultar.")
+        st.caption("Hay varios registros para este nombre; selecciona el que corresponde a la mesa.")
         indice = st.selectbox("Registro de desempeño", list(range(len(registros))), index=None,
                               placeholder="Selecciona una mesa o fila",
                               format_func=lambda i: f"{registros[i]['mesa'] or 'Sin mesa'} · fila {registros[i]['fila']}",
-                              key="registro_"+archivo_id)
+                              key="registro_" + archivo_id)
         if indice is None:
             return
         registro = registros[indice]
@@ -650,18 +756,22 @@ def mostrar_indicadores(registros, tipo, archivo_id):
         registro = registros[0]
     if tipo == "abreviada":
         st.caption("Coincidencia por nombre abreviado: " + registro["nombre"])
-    if registro["mesa"]:
-        st.text("Mesa: " + registro["mesa"])
-    indicadores = registro["indicadores"]
-    for etiqueta, aliases in INDICADORES_PRINCIPALES:
-        valor = next((v for k, v in indicadores.items() if normalizar(k) in aliases), "—")
-        st.metric(etiqueta, valor)
-    with st.expander("Ver todos los indicadores"):
-        if indicadores:
-            st.dataframe([{"Indicador": k, "Valor": v} for k, v in indicadores.items()],
-                         hide_index=True, width="stretch")
-        else:
-            st.info("La fila tiene nombre, pero no tiene columnas de indicadores.")
+    if registro.get("mesa"):
+        st.caption("Mesa de desempeño: " + str(registro["mesa"]))
+    indicadores = registro.get("indicadores", {})
+    if not indicadores:
+        st.info("La fila tiene nombre, pero no tiene columnas de indicadores.")
+        return
+    tarjetas = []
+    for etiqueta, valor in sorted(indicadores.items(), key=lambda item: (prioridad_indicador(item[0]), normalizar(item[0]))):
+        fondo, borde, texto, estado = estilo_indicador(etiqueta, valor)
+        tarjetas.append(
+            '<div class="kpi-card" style="background:' + fondo + ';border-color:' + borde + ';color:' + texto + ';">'
+            '<div class="kpi-label">' + html.escape(str(etiqueta)) + '</div>'
+            '<div class="kpi-value">' + html.escape(str(valor if str(valor).strip() else "—")) + '</div>'
+            '<div class="kpi-status">' + html.escape(estado) + '</div></div>'
+        )
+    st.markdown('<div class="kpi-grid">' + ''.join(tarjetas) + '</div>', unsafe_allow_html=True)
 
 
 @st.cache_data(ttl=60, max_entries=8, show_spinner=False)
@@ -773,22 +883,70 @@ def filtro(etiqueta, opciones, key):
     return st.selectbox(etiqueta, opciones, key=key)
 
 
-def mostrar_foto(persona, demo, credenciales_json, ancho="stretch"):
+def obtener_foto_bytes(persona, demo, credenciales_json):
+    """Devuelve bytes, MIME y si se trata de una foto pendiente."""
     archivo = persona.get("foto")
+    if not archivo:
+        return foto_demo(1), "image/png", True
+    if demo:
+        return foto_demo(int(archivo["id"])), "image/png", False
+    if int(archivo.get("size", 0)) > MAX_BYTES:
+        raise ValueError("La foto supera 10 MB.")
+    return descargar_foto(archivo["id"], archivo.get("modifiedTime", ""), credenciales_json), "image/jpeg", False
+
+
+def mostrar_foto(persona, demo, credenciales_json, ancho="stretch"):
     try:
-        if not archivo:
-            contenido = foto_demo(1)
-        elif demo:
-            contenido = foto_demo(int(archivo["id"]))
-        else:
-            if int(archivo.get("size", 0)) > MAX_BYTES:
-                raise ValueError("La foto supera 10 MB.")
-            contenido = descargar_foto(archivo["id"], archivo.get("modifiedTime", ""), credenciales_json)
+        contenido, _, pendiente = obtener_foto_bytes(persona, demo, credenciales_json)
         st.image(contenido, width=ancho)
+        if pendiente:
+            st.caption("Foto pendiente")
     except Exception:
         st.warning("No se pudo cargar esta foto. Comprueba el formato, tamaño y permisos.")
-    if not archivo:
-        st.caption("Foto pendiente")
+
+
+def mostrar_tarjeta_colaborador(persona, demo, credenciales_json):
+    """La foto es el enlace que abre la ficha individual; la tarjeta no revela KPI."""
+    try:
+        contenido, mime, pendiente = obtener_foto_bytes(persona, demo, credenciales_json)
+    except Exception:
+        contenido, mime, pendiente = foto_demo(1), "image/png", False
+    imagen = base64.b64encode(contenido).decode("ascii")
+    url = "?colaborador=" + quote(str(persona["id"]))
+    nombre = html.escape(str(persona.get("nombre", "Sin nombre")))
+    rol = html.escape(str(persona.get("rol", "" )).title())
+    mesa = html.escape(str(persona.get("mesa", "Sin mesa") or "Sin mesa"))
+    nota = '<div class="person-meta">Foto pendiente</div>' if pendiente else ""
+    st.markdown(
+        '<div class="person-card">'
+        '<a class="person-photo-link" href="' + url + '" target="_self" title="Abrir desempeño de ' + nombre + '">'
+        '<img src="data:' + mime + ';base64,' + imagen + '" alt="Foto de ' + nombre + '"></a>'
+        '<div class="person-name">' + nombre + '</div>'
+        '<div class="person-meta">' + rol + ' · ' + mesa + '</div>' + nota +
+        '<a class="person-open" href="' + url + '" target="_self">Ver desempeño →</a>'
+        '</div>', unsafe_allow_html=True
+    )
+
+
+def mostrar_perfil_dashboard(persona, demo, credenciales_json):
+    """Cabecera vertical de perfil, seguida de las tarjetas de indicadores."""
+    try:
+        contenido, mime, pendiente = obtener_foto_bytes(persona, demo, credenciales_json)
+    except Exception:
+        contenido, mime, pendiente = foto_demo(1), "image/png", False
+    imagen = base64.b64encode(contenido).decode("ascii")
+    nombre = html.escape(str(persona.get("nombre", "Sin nombre")))
+    rol = html.escape(str(persona.get("rol", "")).title())
+    mesa = html.escape(str(persona.get("mesa", "Sin mesa") or "Sin mesa"))
+    jefe = html.escape(str(persona.get("jefe", "") or ""))
+    chip_jefe = '<span class="profile-chip">Jefe de crédito: ' + jefe + '</span>' if jefe and normalizar(rol) != normalizar("Jefe De Crédito") else ""
+    chip_foto = '<span class="profile-chip">Foto pendiente</span>' if pendiente else ""
+    st.markdown(
+        '<div class="profile-header"><img src="data:' + mime + ';base64,' + imagen + '" alt="Foto de ' + nombre + '">'
+        '<div class="profile-title">' + nombre + '</div><div class="profile-subtitle">' + rol + '</div>'
+        '<span class="profile-chip">Mesa: ' + mesa + '</span>' + chip_jefe + chip_foto + '</div>',
+        unsafe_allow_html=True
+    )
 
 
 def main():
@@ -823,14 +981,16 @@ def main():
     if not cuenta:
         return
 
+    inyectar_estilos_dashboard()
     st.title("📊 Desempeño")
-    st.caption("La información visible depende de tu cuenta y de la estructura de colaboradores.")
+    st.caption("Panel de desempeño por equipos. Las fichas y los indicadores respetan los permisos de tu cuenta.")
     with st.sidebar:
         st.subheader("Sesión")
         st.caption(f"Usuario: {cuenta.get('usuario', '')}")
         st.caption(f"Información del equipo: {cuenta.get('informacion_equipo', 'NO') or 'NO'}")
         if st.button("Cerrar sesión", use_container_width=True):
             cerrar_sesion()
+            st.query_params.clear()
             st.rerun()
         st.divider()
         st.subheader("Directorio")
@@ -840,12 +1000,12 @@ def main():
             leer_estructura.clear()
             leer_login.clear()
         automatico = st.checkbox("Actualizar cada minuto", value=True)
-        st.caption("La actualización automática funciona mientras esta página está abierta y activa. El estado de LOGIN se vuelve a validar periódicamente.")
-        st.caption("La estructura se toma de ACCESOS. Las fotos se relacionan por nombre.")
+        st.caption("La actualización funciona mientras la pestaña esté abierta y activa. El estado de LOGIN se valida periódicamente.")
+        st.caption("Las fotos y la estructura se consultan desde Google Drive.")
+
     @st.fragment(run_every=15 if automatico else None)
     def galeria():
-        # Revalida el estado de la cuenta periódicamente; ante un fallo de verificación,
-        # la aplicación cierra la sesión por seguridad en lugar de mantener el acceso.
+        # Revalida la cuenta activa antes de renderizar cualquier información.
         if demo:
             cuentas_actuales = cuentas_demo()
         else:
@@ -853,25 +1013,28 @@ def main():
                 cuentas_actuales = leer_login(accesos_id, hoja_login, cred_json)
             except Exception:
                 cerrar_sesion()
+                st.query_params.clear()
                 st.error("No se pudo verificar tu acceso. Por seguridad, la sesión se cerró.")
                 st.rerun()
                 return
         cuenta_actual = buscar_cuenta_login(cuentas_actuales, st.session_state.get("login_usuario", ""))
         if not cuenta_actual or not cuenta_actual.get("activo"):
             cerrar_sesion()
+            st.query_params.clear()
             st.warning("Tu cuenta fue desactivada o dejó de estar autorizada. Inicia sesión nuevamente.")
             st.rerun()
             return
+
         if demo:
             st.info("DEMOSTRACIÓN · Nombres e imágenes ficticios; no se está leyendo Drive.")
             fotos = [{"id": str(i), "colaborador": n} for i, n in enumerate(
                 ["Ana Ejemplo", "Carlos Ejemplo", "María Ejemplo"])]
             omitidas = 0
             registros, avisos = interpretar_desempeno([
-                ORDEN_ORIGINAL,
-                ["MESA 1", "Ana Ejemplo", "5", "12", "3", "4", "1", "3", "S/ 1,000.00", "S/ 700.00", "30%", "S/ 100.00", "S/ 200.00"],
-                ["MESA 1", "Carlos Ejemplo", "6", "15", "4", "2", "0", "2", "S/ 1,500.00", "S/ 900.00", "25%", "S/ 150.00", "S/ 250.00"],
-                ["MESA 2", "María Ejemplo", "7", "18", "5", "3", "0", "3", "S/ 2,000.00", "S/ 800.00", "40%", "S/ 120.00", "S/ 300.00"],
+                ["MESA", "ASESOR", "BOLSAS MEDIO DIA", "BOLSAS CIERRE", "CLIENTES RECUPERADO", "CLIENTES NUEVO", "VARIACION CLIENTES", "NO RENOVADOS", "VARIACION DE CARTERA", "RECUPERACIÓN DE EFECTIVO", "RECUPERACIÓN DE MORA (30%)", "RECUPERACION MORA AGOSTO", "MORA SEPTIEMBRE"],
+                ["MESA 1", "Ana Ejemplo", "69%", "96%", "3", "4", "2", "1", "S/ 1,000.00", "S/ 700.00", "30%", "S/ 100.00", "S/ 200.00"],
+                ["MESA 1", "Carlos Ejemplo", "66%", "88%", "4", "2", "0", "2", "S/ 1,500.00", "S/ 900.00", "25%", "S/ 150.00", "S/ 250.00"],
+                ["MESA 2", "María Ejemplo", "62%", "73%", "5", "3", "-2", "0", "S/ 2,000.00", "S/ 800.00", "40%", "S/ 120.00", "S/ 300.00"],
             ])
             estructura, avisos_estructura = interpretar_estructura([
                 ["MESAS", "JEFE DE CREDITO", "ASESORES", "PROMOTORES"],
@@ -899,6 +1062,7 @@ def main():
             except Exception as error:
                 estructura, avisos_estructura = [], []
                 st.warning("Estructura no disponible. " + error_estructura(error))
+
         for aviso in avisos + avisos_estructura:
             st.info(aviso)
         if omitidas:
@@ -907,9 +1071,6 @@ def main():
         if not equipo_completo:
             st.info("Todavía no hay colaboradores para mostrar. Revisa los avisos, añade personas a ESTRUCTURA DE COLABORADORES o coloca fotos con sus nombres en la carpeta de fotos.")
             return
-        # Mantiene los nombres completos de toda la estructura solo para detectar
-        # coincidencias ambiguas; los registros que se muestran siguen limitados
-        # por aplicar_permisos_equipo.
         nombres_equipo_completo = [c["nombre"] for c in equipo_completo]
         equipo, descripcion_acceso, tipo_acceso, error_acceso = aplicar_permisos_equipo(equipo_completo, cuenta_actual)
         if not equipo:
@@ -918,35 +1079,53 @@ def main():
             return
         st.caption("Acceso autorizado · " + descripcion_acceso)
 
-        # Los asesores/promotores (y cualquier cuenta limitada) solo ven su ficha.
-        # Se sale antes de crear filtros, resumen de equipos o tarjetas de compañeros.
+        # Asesores, promotores y cuentas limitadas llegan directamente a su ficha propia.
         if tipo_acceso == "individual":
-            st.subheader("Mi desempeño")
+            st.subheader("Mi dashboard de desempeño")
             st.caption("Esta cuenta solo puede consultar su propia información.")
-            nombres_propios = nombres_equipo_completo
             for persona in equipo:
-                with st.container(border=True):
-                    columnas_personal = st.columns([1, 3])
-                    with columnas_personal[0]:
-                        mostrar_foto(persona, demo, cred_json, ancho=150)
-                    with columnas_personal[1]:
-                        st.subheader(persona["nombre"])
-                        st.caption(persona["rol"].title())
-                        if fallo_desempeno:
-                            st.warning("Tu desempeño no está disponible en este momento. Revisa el aviso de conexión.")
-                        else:
-                            registros_persona, tipo_nombre = buscar_desempeno(
-                                persona["nombre"], registros, nombres_propios, persona["mesa"])
-                            mostrar_indicadores(registros_persona, tipo_nombre, persona["id"])
+                mostrar_perfil_dashboard(persona, demo, cred_json)
+                if fallo_desempeno:
+                    st.warning("Tu desempeño no está disponible en este momento. Revisa el aviso de conexión.")
+                else:
+                    registros_persona, tipo_nombre = buscar_desempeno(
+                        persona["nombre"], registros, nombres_equipo_completo, persona["mesa"])
+                    mostrar_indicadores(registros_persona, tipo_nombre, persona["id"])
             return
 
-        nombres = [normalizar(f["colaborador"]) for f in fotos]
-        if len(nombres) != len(set(nombres)):
+        # La selección se acepta únicamente si el colaborador pertenece al alcance ya autorizado.
+        seleccionado_id = str(st.query_params.get("colaborador", "") or "")
+        if seleccionado_id:
+            persona_seleccionada = next((c for c in equipo
+                if c.get("id") == seleccionado_id and c.get("rol") != "JEFE DE CRÉDITO"), None)
+            if persona_seleccionada:
+                if st.button("← Volver al equipo", type="secondary"):
+                    st.query_params.pop("colaborador", None)
+                    st.rerun()
+                st.subheader("Ficha individual de desempeño")
+                mostrar_perfil_dashboard(persona_seleccionada, demo, cred_json)
+                if fallo_desempeno:
+                    st.warning("El desempeño no está disponible en este momento. Revisa la conexión con PRODUCTIVIDAD.")
+                else:
+                    registros_persona, tipo_nombre = buscar_desempeno(
+                        persona_seleccionada["nombre"], registros, nombres_equipo_completo,
+                        persona_seleccionada["mesa"])
+                    mostrar_indicadores(registros_persona, tipo_nombre, persona_seleccionada["id"])
+                return
+            # Evita mantener en la URL una ficha fuera del alcance del usuario.
+            st.query_params.pop("colaborador", None)
+            st.rerun()
+            return
+
+        st.subheader("Dashboard del equipo")
+        st.caption("Selecciona una foto para abrir la ficha del colaborador y ver sus indicadores. No se muestran datos individuales hasta entrar en la ficha.")
+        if tipo_acceso == "total":
+            st.caption("Vista de acceso total autorizada por LOGIN.")
+        nombres_fotos = [normalizar(f["colaborador"]) for f in fotos]
+        if len(nombres_fotos) != len(set(nombres_fotos)):
             st.warning("Hay fotos con el mismo nombre. No se asignan a la estructura hasta resolver el duplicado.")
-        sin_estructura = sum(c["rol"] == "SIN ESTRUCTURA" for c in equipo)
-        if sin_estructura:
-            st.caption(f"{sin_estructura} fotos aparecen como SIN ESTRUCTURA. Añade sus nombres a ESTRUCTURA DE COLABORADORES para asignarles mesa, jefe y rol.")
-        st.subheader("Filtrar el equipo")
+
+        st.subheader("Filtros")
         columnas_filtros = st.columns(3)
         mesas = ["Todas"] + opciones_unicas((c["mesa"] for c in equipo), clave=clave_mesa)
         if any(not c["mesa"] for c in equipo):
@@ -964,80 +1143,47 @@ def main():
         roles = ["Todos"] + opciones_unicas(c["rol"] for c in integrantes)
         with columnas_filtros[2]:
             rol = filtro("Rol", roles, "filtro_rol")
-        texto = st.text_input("Buscar por nombre", placeholder="Escribe el nombre de un colaborador")
+        texto = st.text_input("Buscar colaborador", placeholder="Escribe el nombre de una persona")
         visibles = filtrar_equipo(integrantes, rol=rol, busqueda=texto)
-        grupos = agrupar_equipos(por_jefe)
-        if grupos:
-            st.subheader("Equipos seleccionados")
-            st.dataframe([{"Mesa / equipo": g["mesa"] or "Sin asignación",
-                           "Jefe de crédito": g["jefe"] or "Sin jefe asignado",
-                           "Asesores": len({normalizar(c["nombre"]) for c in g["integrantes"] if c["rol"] == "ASESOR"}),
-                           "Promotores": len({normalizar(c["nombre"]) for c in g["integrantes"] if c["rol"] == "PROMOTOR"}),
-                           "Integrantes": len({normalizar(c["nombre"]) for c in g["integrantes"]})} for g in grupos],
-                         hide_index=True, width="stretch")
-            st.caption("Esta estructura muestra el equipo completo de cada jefe. Los filtros de rol y nombre se aplican al desempeño de abajo.")
-        nombres_equipo = nombres_equipo_completo
-        tabla = tabla_desempeno(visibles, registros, nombres_equipo)
-        con_desempeno = {normalizar(f["Colaborador"]) for f in tabla if f["Desempeño"] == "Disponible"}
+
         resumen = st.columns(4)
-        for columna, etiqueta, valor in [
-            (resumen[0], "Integrantes", len({normalizar(c["nombre"]) for c in visibles})),
-            (resumen[1], "Asesores", len({normalizar(c["nombre"]) for c in visibles if c["rol"] == "ASESOR"})),
-            (resumen[2], "Promotores", len({normalizar(c["nombre"]) for c in visibles if c["rol"] == "PROMOTOR"})),
-            (resumen[3], "Con desempeño", len(con_desempeno)),
-        ]:
-            columna.metric(etiqueta, valor)
+        resumen_data = [
+            ("Integrantes", len({normalizar(c["nombre"]) for c in visibles})),
+            ("Asesores", len({normalizar(c["nombre"]) for c in visibles if normalizar(c["rol"]) == "asesor"})),
+            ("Promotores", len({normalizar(c["nombre"]) for c in visibles if normalizar(c["rol"]) == "promotor"})),
+            ("Con foto", sum(1 for c in visibles if c.get("foto"))),
+        ]
+        for columna, (etiqueta, valor) in zip(resumen, resumen_data):
+            with columna:
+                st.metric(etiqueta, valor)
         if not visibles:
-            st.info("No hay integrantes con estos filtros. El jefe figura como responsable; añade sus asesores y promotores en la estructura si todavía no aparecen.")
+            st.info("No hay colaboradores con estos filtros. Ajusta la mesa, el jefe, el rol o la búsqueda.")
             return
-        st.subheader("Desempeño del equipo")
-        if fallo_desempeno:
-            for fila in tabla:
-                fila["Desempeño"] = "Fuente no disponible"
-        st.dataframe(tabla, hide_index=True, width="stretch")
-        st.caption("Cada fila corresponde a un integrante de la mesa seleccionada. Los registros repetidos se consultan en la tarjeta; no se suman ni se mezclan.")
-        with st.expander("Ver estructura del equipo"):
-            st.dataframe([{"Mesa": c["mesa"] or "Sin mesa", "Jefe de crédito": c["jefe"] or "Sin jefe asignado",
-                           "Colaborador": c["nombre"], "Rol": c["rol"],
-                           "Foto": "Disponible" if c["foto"] else "Pendiente"} for c in visibles],
-                         hide_index=True, width="stretch")
-        if not fallo_desempeno:
-            vinculados = sum(bool(buscar_desempeno(c["nombre"], registros, nombres_equipo, c["mesa"])[0]) for c in visibles)
-            st.caption(f"{vinculados} de {len(visibles)} asignaciones visibles tienen desempeño asociado.")
-        # Paginación: evita descargar todas las fotos de una carpeta grande.
-        paginas = max(1, (len(visibles)+11)//12)
-        pagina = filtro("Página", list(range(1, paginas+1)), "pagina")
-        st.caption(f"{len(visibles)} asignaciones · Página {pagina} de {paginas}")
-        visibles = visibles[(pagina-1)*12:pagina*12]
-        grupos_visibles = agrupar_equipos(visibles)
+
+        paginas = max(1, (len(visibles) + 11) // 12)
+        pagina = filtro("Página de colaboradores", list(range(1, paginas + 1)), "pagina_dashboard")
+        st.caption(f"Mostrando {(pagina - 1) * 12 + 1}–{min(pagina * 12, len(visibles))} de {len(visibles)} colaboradores.")
+        visibles_pagina = visibles[(pagina - 1) * 12:pagina * 12]
+        grupos_visibles = agrupar_equipos(visibles_pagina)
         for grupo in grupos_visibles:
-            responsable = next((g["responsable"] for g in grupos
-                if clave_mesa(g["mesa"]) == clave_mesa(grupo["mesa"])
-                and normalizar(g["jefe"]) == normalizar(grupo["jefe"])), None)
-            with st.container(border=True):
-                st.subheader("Equipo · " + (grupo["mesa"] or "Sin mesa asignada"))
-                if responsable:
-                    cabecera = st.columns([1, 5])
-                    with cabecera[0]:
-                        mostrar_foto(responsable, demo, cred_json, ancho=110)
-                    with cabecera[1]:
-                        st.text("Jefe de crédito: " + grupo["jefe"])
-                        st.caption("Responsable de los asesores y promotores de esta mesa.")
-                else:
-                    st.text("Jefe de crédito: " + (grupo["jefe"] or "Sin jefe asignado"))
-                columnas = st.columns(3)
-                for i, colaborador in enumerate(grupo["integrantes"]):
-                    with columnas[i % 3]:
-                        with st.container(border=True):
-                            mostrar_foto(colaborador, demo, cred_json)
-                            st.text(colaborador["nombre"])
-                            st.caption(colaborador["rol"])
-                            if fallo_desempeno:
-                                st.caption("Desempeño no disponible: revisa el aviso de conexión.")
-                            else:
-                                registros_persona, tipo = buscar_desempeno(colaborador["nombre"], registros, nombres_equipo, colaborador["mesa"])
-                                mostrar_indicadores(registros_persona, tipo, colaborador["id"])
-        st.caption("ESTRUCTURA DE COLABORADORES define mesa, jefe y rol. Una persona con varias asignaciones aparece en cada una. Las fotos se buscan directamente en la carpeta, sin recorrer subcarpetas.")
+            mesa_grupo = grupo["mesa"] or "Sin mesa asignada"
+            responsable = next((c for c in equipo
+                if c.get("rol") == "JEFE DE CRÉDITO"
+                and clave_mesa(c.get("mesa", "")) == clave_mesa(grupo["mesa"])
+                and normalizar(c.get("jefe", "")) == normalizar(grupo["jefe"])), None)
+            jefe_nombre = grupo.get("jefe") or (responsable.get("nombre") if responsable else "Sin jefe asignado")
+            st.markdown(
+                '<div class="team-banner"><strong>' + html.escape(str(mesa_grupo)) +
+                '</strong><br><span>Jefe de crédito: ' + html.escape(str(jefe_nombre)) +
+                ' · ' + str(len(grupo["integrantes"])) + ' integrante(s) en esta vista</span></div>',
+                unsafe_allow_html=True
+            )
+            columnas = st.columns(4)
+            for i, colaborador in enumerate(grupo["integrantes"]):
+                with columnas[i % 4]:
+                    mostrar_tarjeta_colaborador(colaborador, demo, cred_json)
+        st.caption("La estructura define las mesas, jefaturas y roles. Las fichas se abren desde la foto y solo se muestran si están dentro del alcance autorizado de la cuenta.")
+
     galeria()
 
 
