@@ -29,6 +29,11 @@ NOMBRES_ASESOR = {"asesor", "asesores", "colaborador", "colaboradores", "persona
                   "nombre", "nombre completo"}
 SHEET_MIME = "application/vnd.google-apps.spreadsheet"
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+INDICADORES_PRINCIPALES = [
+    ("Bolsas al cierre", {"bolsas cierre"}),
+    ("Clientes nuevos", {"clientes nuevo", "clientes nuevos"}),
+    ("Clientes recuperados", {"clientes recuperado", "clientes recuperados"}),
+]
 
 
 def clave_mesa(mesa):
@@ -237,6 +242,38 @@ def filtrar_equipo(equipo, mesa="Todas", jefe="Todos", rol="Todos", busqueda="")
             and normalizar(busqueda) in normalizar(c["nombre"])]
 
 
+def agrupar_equipos(personas):
+    """Una mesa es un equipo. El jefe es su responsable y no un subordinado."""
+    grupos = {}
+    for persona in personas:
+        clave = (clave_mesa(persona["mesa"]), normalizar(persona["jefe"]))
+        grupo = grupos.setdefault(clave, {"mesa": persona["mesa"], "jefe": persona["jefe"],
+                                         "responsable": None, "integrantes": []})
+        if persona["rol"] == "JEFE DE CRÉDITO":
+            grupo["responsable"] = persona
+        else:
+            grupo["integrantes"].append(persona)
+    return list(grupos.values())
+
+
+def tabla_desempeno(integrantes, registros, nombres_equipo):
+    """Una fila por integrante/asignación, sin sumar ni mezclar registros."""
+    tabla = []
+    for persona in integrantes:
+        encontrados, tipo = buscar_desempeno(persona["nombre"], registros, nombres_equipo, persona["mesa"])
+        registro = encontrados[0] if len(encontrados) == 1 else None
+        estado = ("Disponible" if registro else "Varios registros: consultar tarjeta" if encontrados
+                  else "Nombre ambiguo" if tipo == "ambigua" else "Sin datos")
+        fila = {"Mesa / equipo": persona["mesa"] or "Sin mesa",
+                "Jefe de crédito": persona["jefe"] or "Sin jefe asignado",
+                "Colaborador": persona["nombre"], "Rol": persona["rol"], "Desempeño": estado}
+        indicadores = registro["indicadores"] if registro else {}
+        for etiqueta, aliases in INDICADORES_PRINCIPALES:
+            fila[etiqueta] = next((v for k, v in indicadores.items() if normalizar(k) in aliases), "—")
+        tabla.append(fila)
+    return tabla
+
+
 def nombre_colaborador(archivo):
     # Juan_Perez.jpg → Juan Perez. Conserva tildes y guiones de nombres compuestos.
     return " ".join(Path(archivo).stem.replace("_", " ").split())
@@ -373,9 +410,7 @@ def mostrar_indicadores(registros, tipo, archivo_id):
     if registro["mesa"]:
         st.text("Mesa: " + registro["mesa"])
     indicadores = registro["indicadores"]
-    for etiqueta, aliases in [("Bolsas al cierre", {"bolsas cierre"}),
-                               ("Clientes nuevos", {"clientes nuevo", "clientes nuevos"}),
-                               ("Clientes recuperados", {"clientes recuperado", "clientes recuperados"})]:
+    for etiqueta, aliases in INDICADORES_PRINCIPALES:
         valor = next((v for k, v in indicadores.items() if normalizar(k) in aliases), "—")
         st.metric(etiqueta, valor)
     with st.expander("Ver todos los indicadores"):
@@ -494,10 +529,28 @@ def filtro(etiqueta, opciones, key):
     return st.selectbox(etiqueta, opciones, key=key)
 
 
+def mostrar_foto(persona, demo, credenciales_json, ancho="stretch"):
+    archivo = persona.get("foto")
+    try:
+        if not archivo:
+            contenido = foto_demo(1)
+        elif demo:
+            contenido = foto_demo(int(archivo["id"]))
+        else:
+            if int(archivo.get("size", 0)) > MAX_BYTES:
+                raise ValueError("La foto supera 10 MB.")
+            contenido = descargar_foto(archivo["id"], archivo.get("modifiedTime", ""), credenciales_json)
+        st.image(contenido, width=ancho)
+    except Exception:
+        st.warning("No se pudo cargar esta foto. Comprueba el formato, tamaño y permisos.")
+    if not archivo:
+        st.caption("Foto pendiente")
+
+
 def main():
     st.set_page_config(page_title="Desempeño · Colaboradores", page_icon="👥", layout="wide")
     st.title("👥 Desempeño del equipo")
-    st.caption("Organización por mesa y jefe de crédito · Fotos y desempeño del equipo")
+    st.caption("Cada mesa es un equipo a cargo de un jefe de crédito, con asesores y promotores.")
     try:
         (carpeta_id, credenciales, demo, productividad_id, hoja_desempeno,
          estructura_carpeta_id, accesos_id, hoja_colaboradores) = configuracion()
@@ -581,7 +634,7 @@ def main():
         if any(not c["mesa"] for c in equipo):
             mesas.append("Sin mesa")
         with columnas_filtros[0]:
-            mesa = filtro("Mesa", mesas, "filtro_mesa")
+            mesa = filtro("Mesa (equipo)", mesas, "filtro_mesa")
         por_mesa = filtrar_equipo(equipo, mesa=mesa)
         jefes = ["Todos"] + opciones_unicas(c["jefe"] for c in por_mesa)
         if any(not c["jefe"] for c in por_mesa):
@@ -589,28 +642,47 @@ def main():
         with columnas_filtros[1]:
             jefe = filtro("Jefe de crédito", jefes, "filtro_jefe")
         por_jefe = filtrar_equipo(por_mesa, jefe=jefe)
-        roles = ["Todos"] + opciones_unicas(c["rol"] for c in por_jefe)
+        integrantes = [c for c in por_jefe if c["rol"] != "JEFE DE CRÉDITO"]
+        roles = ["Todos"] + opciones_unicas(c["rol"] for c in integrantes)
         with columnas_filtros[2]:
             rol = filtro("Rol", roles, "filtro_rol")
         texto = st.text_input("Buscar por nombre", placeholder="Escribe el nombre de un colaborador")
-        visibles = filtrar_equipo(equipo, mesa, jefe, rol, texto)
+        visibles = filtrar_equipo(integrantes, rol=rol, busqueda=texto)
+        grupos = agrupar_equipos(por_jefe)
+        if grupos:
+            st.subheader("Equipos seleccionados")
+            st.dataframe([{"Mesa / equipo": g["mesa"] or "Sin asignación",
+                           "Jefe de crédito": g["jefe"] or "Sin jefe asignado",
+                           "Asesores": len({normalizar(c["nombre"]) for c in g["integrantes"] if c["rol"] == "ASESOR"}),
+                           "Promotores": len({normalizar(c["nombre"]) for c in g["integrantes"] if c["rol"] == "PROMOTOR"}),
+                           "Integrantes": len({normalizar(c["nombre"]) for c in g["integrantes"]})} for g in grupos],
+                         hide_index=True, width="stretch")
+            st.caption("Esta estructura muestra el equipo completo de cada jefe. Los filtros de rol y nombre se aplican al desempeño de abajo.")
+        nombres_equipo = [c["nombre"] for c in equipo]
+        tabla = tabla_desempeno(visibles, registros, nombres_equipo)
+        con_desempeno = {normalizar(f["Colaborador"]) for f in tabla if f["Desempeño"] == "Disponible"}
         resumen = st.columns(4)
         for columna, etiqueta, valor in [
-            (resumen[0], "Personas", len({normalizar(c["nombre"]) for c in visibles})),
-            (resumen[1], "Mesas", len({clave_mesa(c["mesa"]) for c in visibles if c["mesa"]})),
-            (resumen[2], "Asesores", len({normalizar(c["nombre"]) for c in visibles if c["rol"] == "ASESOR"})),
-            (resumen[3], "Promotores", len({normalizar(c["nombre"]) for c in visibles if c["rol"] == "PROMOTOR"})),
+            (resumen[0], "Integrantes", len({normalizar(c["nombre"]) for c in visibles})),
+            (resumen[1], "Asesores", len({normalizar(c["nombre"]) for c in visibles if c["rol"] == "ASESOR"})),
+            (resumen[2], "Promotores", len({normalizar(c["nombre"]) for c in visibles if c["rol"] == "PROMOTOR"})),
+            (resumen[3], "Con desempeño", len(con_desempeno)),
         ]:
             columna.metric(etiqueta, valor)
         if not visibles:
-            st.info("No hay colaboradores con estos filtros.")
+            st.info("No hay integrantes con estos filtros. El jefe figura como responsable; añade sus asesores y promotores en la estructura si todavía no aparecen.")
             return
+        st.subheader("Desempeño del equipo")
+        if fallo_desempeno:
+            for fila in tabla:
+                fila["Desempeño"] = "Fuente no disponible"
+        st.dataframe(tabla, hide_index=True, width="stretch")
+        st.caption("Cada fila corresponde a un integrante de la mesa seleccionada. Los registros repetidos se consultan en la tarjeta; no se suman ni se mezclan.")
         with st.expander("Ver estructura del equipo"):
             st.dataframe([{"Mesa": c["mesa"] or "Sin mesa", "Jefe de crédito": c["jefe"] or "Sin jefe asignado",
                            "Colaborador": c["nombre"], "Rol": c["rol"],
                            "Foto": "Disponible" if c["foto"] else "Pendiente"} for c in visibles],
                          hide_index=True, width="stretch")
-        nombres_equipo = [c["nombre"] for c in equipo]
         if not fallo_desempeno:
             vinculados = sum(bool(buscar_desempeno(c["nombre"], registros, nombres_equipo, c["mesa"])[0]) for c in visibles)
             st.caption(f"{vinculados} de {len(visibles)} asignaciones visibles tienen desempeño asociado.")
@@ -619,34 +691,34 @@ def main():
         pagina = filtro("Página", list(range(1, paginas+1)), "pagina")
         st.caption(f"{len(visibles)} asignaciones · Página {pagina} de {paginas}")
         visibles = visibles[(pagina-1)*12:pagina*12]
-        columnas = st.columns(3)
-        for i, colaborador in enumerate(visibles):
-            with columnas[i % 3]:
-                with st.container(border=True):
-                    archivo = colaborador["foto"]
-                    try:
-                        if not archivo:
-                            contenido = foto_demo(1)
-                        elif demo:
-                            contenido = foto_demo(int(archivo["id"]))
-                        else:
-                            if int(archivo.get("size", 0)) > MAX_BYTES:
-                                raise ValueError("La foto supera 10 MB. Usa una versión más pequeña.")
-                            contenido = descargar_foto(archivo["id"], archivo.get("modifiedTime", ""), cred_json)
-                        st.image(contenido, width="stretch")
-                    except Exception:
-                        st.warning("No se pudo cargar esta foto. Comprueba el formato, tamaño y permisos.")
-                    if not archivo:
-                        st.caption("Foto pendiente")
-                    st.text(colaborador["nombre"])
-                    st.caption(colaborador["rol"])
-                    st.text("Mesa: " + (colaborador["mesa"] or "Sin mesa"))
-                    st.text("Jefe: " + (colaborador["jefe"] or "Sin jefe asignado"))
-                    if fallo_desempeno:
-                        st.caption("Desempeño no disponible: revisa el aviso de conexión.")
-                    else:
-                        registros_persona, tipo = buscar_desempeno(colaborador["nombre"], registros, nombres_equipo, colaborador["mesa"])
-                        mostrar_indicadores(registros_persona, tipo, colaborador["id"])
+        grupos_visibles = agrupar_equipos(visibles)
+        for grupo in grupos_visibles:
+            responsable = next((g["responsable"] for g in grupos
+                if clave_mesa(g["mesa"]) == clave_mesa(grupo["mesa"])
+                and normalizar(g["jefe"]) == normalizar(grupo["jefe"])), None)
+            with st.container(border=True):
+                st.subheader("Equipo · " + (grupo["mesa"] or "Sin mesa asignada"))
+                if responsable:
+                    cabecera = st.columns([1, 5])
+                    with cabecera[0]:
+                        mostrar_foto(responsable, demo, cred_json, ancho=110)
+                    with cabecera[1]:
+                        st.text("Jefe de crédito: " + grupo["jefe"])
+                        st.caption("Responsable de los asesores y promotores de esta mesa.")
+                else:
+                    st.text("Jefe de crédito: " + (grupo["jefe"] or "Sin jefe asignado"))
+                columnas = st.columns(3)
+                for i, colaborador in enumerate(grupo["integrantes"]):
+                    with columnas[i % 3]:
+                        with st.container(border=True):
+                            mostrar_foto(colaborador, demo, cred_json)
+                            st.text(colaborador["nombre"])
+                            st.caption(colaborador["rol"])
+                            if fallo_desempeno:
+                                st.caption("Desempeño no disponible: revisa el aviso de conexión.")
+                            else:
+                                registros_persona, tipo = buscar_desempeno(colaborador["nombre"], registros, nombres_equipo, colaborador["mesa"])
+                                mostrar_indicadores(registros_persona, tipo, colaborador["id"])
         st.caption("ESTRUCTURA DE COLABORADORES define mesa, jefe y rol. Una persona con varias asignaciones aparece en cada una. Las fotos se buscan directamente en la carpeta, sin recorrer subcarpetas.")
     galeria()
 
